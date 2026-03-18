@@ -8,7 +8,7 @@
 #include <MPU6050_tockn.h>
 #include <Adafruit_MLX90614.h>
 #include <TinyGPSPlus.h>
-#include <SoftwareSerial.h>
+#include <HardwareSerial.h> 
 
 // ===================== THEM THU VIEN TFT =====================
 #include <SPI.h>
@@ -31,39 +31,34 @@ FirebaseData fbdo;
 FirebaseAuth auth;
 FirebaseConfig config;
 bool signupOK = false;
+
+// ===================== BIẾN LƯU MÃ THIẾT BỊ =====================
 String deviceID = "";
 TaskHandle_t FirebaseTaskHandle;
 
 // ===================== KHAI BÁO CHÂN PHẦN CỨNG =====================
-// Bụi mịn, Cảm ứng, Còi
-#define DUST_VO_PIN  4    
+#define DUST_VO_PIN  34   
 #define DUST_LED_PIN 5    
 #define TOUCH_PIN    13   
-#define BUZZER_PIN   14   
-
-// Màn hình TFT
-#define TFT_MOSI 23
-#define TFT_SCLK 18
-#define TFT_CS   27
-#define TFT_DC   4
-#define TFT_RST  16
-
-// I2C
-#define SDA_PIN 21
-#define SCL_PIN 22
+#define BUZZER_PIN   15   
 
 // ===================== KHAI BAO CAM BIEN =====================
 MAX30105 particleSensor;
 MPU6050 mpu6050(Wire);
 Adafruit_MLX90614 mlx = Adafruit_MLX90614();
 
-// ===================== GPS =====================
+// ===================== GPS (HardwareSerial) =====================
 static const int RXPin = 26, TXPin = 25;
 static const uint32_t GPSBaud = 9600;
-TinyGPSPlus gps;
-SoftwareSerial ss(RXPin, TXPin);
 
-// ===================== BIẾN TOÀN CỤC & LỌC NHIỄU =====================
+TinyGPSPlus gps;
+HardwareSerial gpsSerial(2); 
+
+// ===================== I2C ESP32 =====================
+#define SDA_PIN 21
+#define SCL_PIN 22
+
+// ===================== THOI GIAN IN & BIẾN CỜ =====================
 unsigned long lastPrintSensor = 0;
 const unsigned long sensorInterval = 500; 
 
@@ -72,30 +67,51 @@ float currentTempAmb = 0.0;
 float currentMpuX = 0.0;
 float currentMpuY = 0.0;
 float currentMpuZ = 0.0;
-float currentDust = 0.0; // Biến lưu bụi mịn
+float currentDust = 0.0;
 
 bool isSOS = false;
 bool isFalling = false;
-bool lastTouchState = false;
 
 const float ALPHA_TEMP = 0.2; 
 const float ALPHA_MPU = 0.3;
 
-// ===================== MAX30102 =====================
+// ===================== MAX30102 & TIẾN TRÌNH ĐO =====================
 uint32_t irBuffer[100];
 uint32_t redBuffer[100];
 int32_t bufferLength = 100;
+
 int32_t spo2 = 0;
 int8_t validSPO2 = 0;
 int32_t heartRateValue = 0;
 int8_t validHeartRate = 0;
+
 bool max30102Found = false;
+int measurementProgress = 0; // BIẾN HIỂN THỊ TRẠNG THÁI % ĐO
 
 const int FILTER_SIZE = 7;
 int bpmHistory[FILTER_SIZE] = {0};
 int spo2History[FILTER_SIZE] = {0};
-int bpmCount = 0, spo2Count = 0;
-int bpmIndex = 0, spo2Index = 0;
+int bpmCount = 0;
+int spo2Count = 0;
+int bpmIndex = 0;
+int spo2Index = 0;
+
+// ===================== BIẾN NGẮT NÚT NHẤN =====================
+volatile bool touchDetected = false;
+
+void IRAM_ATTR touchISR() {
+  touchDetected = true; 
+}
+
+// ===================== BIẾN CÒI & CẢNH BÁO TỰ ĐỘNG =====================
+unsigned long lastBeepTime = 0;
+bool buzzerState = false;
+unsigned long healthDangerTimer = 0; 
+
+// ===================== TFT ST7789 =====================
+#define TFT_CS   27
+#define TFT_DC   4
+#define TFT_RST  16
 
 Adafruit_ST7789 tft = Adafruit_ST7789(TFT_CS, TFT_DC, TFT_RST);
 
@@ -106,7 +122,6 @@ void addBPMValue(int value);
 void addSpO2Value(int value);
 int getFilteredBPM();
 int getFilteredSpO2();
-void displayInfo();
 bool initMAX30102();
 void initMAX30102Buffer();
 void updateMAX30102Fast();
@@ -120,12 +135,10 @@ void TaskFirebase(void *pvParameters);
 // ===================== HAM HIEN THI TFT =====================
 void initTFT()
 {
-  // Cấu hình lại chân SPI cho ESP32-S3 để màn hình sáng lên
-  SPI.begin(TFT_SCLK, -1, TFT_MOSI, TFT_CS);
-  
   tft.init(240, 280);   
   tft.setRotation(2);   
   tft.fillScreen(ST77XX_BLACK);
+
   tft.setTextWrap(false);
   tft.setTextColor(ST77XX_WHITE);
   tft.setTextSize(2);
@@ -139,68 +152,93 @@ void initTFT()
 void drawStaticUI()
 {
   tft.fillScreen(ST77XX_BLACK);
-  tft.setTextColor(ST77XX_YELLOW); tft.setTextSize(2);
-  tft.setCursor(20, 5); tft.println("HEALTH MONITOR");
+  
+  tft.setTextColor(ST77XX_YELLOW);
+  tft.setTextSize(2);
+  tft.setCursor(20, 5);
+  tft.println("HEALTH MONITOR");
 
-  tft.setTextColor(ST77XX_CYAN); tft.setTextSize(1);
-  tft.setCursor(20, 25); tft.print("ID: "); tft.println(deviceID);
+  tft.setTextColor(ST77XX_CYAN);
+  tft.setTextSize(1);
+  tft.setCursor(20, 25);
+  tft.print("ID: ");
+  tft.println(deviceID);
+
   tft.drawLine(0, 38, 240, 38, ST77XX_BLUE);
 
-  tft.setTextSize(2); tft.setTextColor(ST77XX_GREEN);
+  tft.setTextSize(2);
+  tft.setTextColor(ST77XX_GREEN);
   tft.setCursor(10, 45); tft.print("BPM: ");
   tft.setCursor(10, 70); tft.print("SpO2:");
 
   tft.setTextColor(ST77XX_WHITE);
   tft.setCursor(10, 100); tft.print("Obj: ");
   tft.setCursor(10, 125); tft.print("Amb: ");
+  tft.setCursor(10, 150); tft.print("Dust:"); 
 
-  tft.setTextSize(1); tft.setTextColor(ST77XX_CYAN);
-  tft.setCursor(10, 155); tft.print("X: ");
-  tft.setCursor(85, 155); tft.print("Y: ");
-  tft.setCursor(160, 155); tft.print("Z: ");
+  tft.setTextSize(1);
+  tft.setTextColor(ST77XX_CYAN);
+  tft.setCursor(10, 180); tft.print("X: ");
+  tft.setCursor(85, 180); tft.print("Y: ");
+  tft.setCursor(160, 180); tft.print("Z: ");
 
-  tft.setCursor(10, 175); tft.print("Dust:");
   tft.setTextColor(ST77XX_MAGENTA);
-  tft.setCursor(10, 195); tft.print("GPS: ");
+  tft.setCursor(10, 200); tft.print("GPS: ");
 
   tft.drawLine(0, 230, 240, 230, ST77XX_BLUE);
-  tft.setTextSize(2); tft.setTextColor(ST77XX_WHITE);
+  tft.setTextSize(2);
+  tft.setTextColor(ST77XX_WHITE);
   tft.setCursor(10, 245); tft.print("SYS:");
 }
 
 void updateTFT()
 {
   tft.setTextSize(2);
+  
+  // ---------- HIỂN THỊ NHỊP TIM ----------
   tft.setTextColor(ST77XX_GREEN, ST77XX_BLACK);
   tft.setCursor(70, 45);
-  if (bpmCount > 0) tft.printf("%-5d", getFilteredBPM());
-  else tft.print("--   ");
+  if (measurementProgress == 0) {
+    tft.print("--   "); // Không có tay
+  } else if (measurementProgress < 100) {
+    tft.printf("%d%%  ", measurementProgress); // Đang đo, hiện %
+  } else {
+    tft.printf("%-5d", getFilteredBPM()); // Đo xong, hiện số thực tế
+  }
 
+  // ---------- HIỂN THỊ SPO2 ----------
   tft.setCursor(80, 70);
-  if (spo2Count > 0) tft.printf("%d%%  ", getFilteredSpO2());
-  else tft.print("--   ");
+  if (measurementProgress == 0) {
+    tft.print("--   ");
+  } else if (measurementProgress < 100) {
+    tft.printf("%d%%  ", measurementProgress);
+  } else {
+    tft.printf("%d%%  ", getFilteredSpO2());
+  }
 
+  // ---------- CÁC THÔNG SỐ KHÁC ----------
   tft.setTextColor(ST77XX_WHITE, ST77XX_BLACK);
   tft.setCursor(70, 100); tft.printf("%-6.1f C", currentTempObj);
   tft.setCursor(70, 125); tft.printf("%-6.1f C", currentTempAmb);
+  tft.setCursor(70, 150); tft.printf("%-5.2f mg/m3", currentDust);
 
-  tft.setTextSize(1); tft.setTextColor(ST77XX_CYAN, ST77XX_BLACK);
-  tft.setCursor(30, 155); tft.printf("%-5.0f", currentMpuX);
-  tft.setCursor(105, 155); tft.printf("%-5.0f", currentMpuY);
-  tft.setCursor(180, 155); tft.printf("%-5.0f", currentMpuZ);
-
-  tft.setCursor(50, 175); tft.printf("%-6.2f mg/m3", currentDust);
+  tft.setTextSize(1);
+  tft.setTextColor(ST77XX_CYAN, ST77XX_BLACK);
+  tft.setCursor(30, 180); tft.printf("%-5.0f", currentMpuX);
+  tft.setCursor(105, 180); tft.printf("%-5.0f", currentMpuY);
+  tft.setCursor(180, 180); tft.printf("%-5.0f", currentMpuZ);
 
   tft.setTextColor(ST77XX_MAGENTA, ST77XX_BLACK);
   if (gps.location.isValid()) {
-    tft.setCursor(50, 195); tft.print("OK        ");
-    tft.setCursor(10, 210); tft.printf("%-9.4f, %-9.4f", gps.location.lat(), gps.location.lng());
+    tft.setCursor(50, 200); tft.print("OK        ");
+    tft.setCursor(10, 215); tft.printf("%-9.4f, %-9.4f", gps.location.lat(), gps.location.lng());
   } else {
-    tft.setCursor(50, 195); tft.print("Waiting...");
-    tft.setCursor(10, 210); tft.print("                    "); 
+    tft.setCursor(50, 200); tft.print("Waiting...");
+    tft.setCursor(10, 215); tft.print("                    "); 
   }
 
-  tft.setTextSize(2); tft.setCursor(65, 245);
+  tft.setTextSize(2);
+  tft.setCursor(65, 245);
   if (isSOS) {
     tft.setTextColor(ST77XX_RED, ST77XX_BLACK); tft.print("SOS ACTIVE! ");
   } else if (isFalling) {
@@ -227,26 +265,56 @@ void updateDustSensor() {
 
 // ===================== TÉ NGÃ, NÚT BẤM, CÒI =====================
 void checkAlarmsAndButtons() {
-  bool touchState = digitalRead(TOUCH_PIN);
-  if (touchState && !lastTouchState) {
-    if (isFalling || isSOS) {
-      isFalling = false;
-      isSOS = false;
-    } else {
-      isSOS = true;
+  if (touchDetected) {
+    touchDetected = false; 
+    static unsigned long lastTouchTime = 0;
+    if (millis() - lastTouchTime > 500) { 
+      if (isFalling || isSOS) {
+        isFalling = false;
+        isSOS = false;
+      } else {
+        isSOS = true;
+      }
+      lastTouchTime = millis();
     }
   }
-  lastTouchState = touchState;
 
   float accX = mpu6050.getAccX();
   float accY = mpu6050.getAccY();
   float accZ = mpu6050.getAccZ();
   float svm = sqrt(pow(accX, 2) + pow(accY, 2) + pow(accZ, 2));
   
-  if (svm > 2.5) isFalling = true; // Ngưỡng phát hiện ngã
+  if (svm > 2.5) {
+    isFalling = true;
+  }
 
-  if (isSOS || isFalling) digitalWrite(BUZZER_PIN, HIGH);
-  else digitalWrite(BUZZER_PIN, LOW);
+  int currentBPM = (measurementProgress == 100 && bpmCount > 0) ? getFilteredBPM() : 0;
+  int currentSpO2 = (measurementProgress == 100 && spo2Count > 0) ? getFilteredSpO2() : 0;
+  
+  bool isHealthDanger = false;
+  if (currentBPM > 0 && (currentBPM < 50 || currentBPM > 120)) isHealthDanger = true;
+  if (currentSpO2 > 0 && currentSpO2 < 90) isHealthDanger = true;
+  if (currentTempObj > 38.5 || (currentTempObj < 35.0 && currentTempObj > 30.0)) isHealthDanger = true;
+
+  if (isHealthDanger) {
+    if (healthDangerTimer == 0) healthDangerTimer = millis(); 
+    if (millis() - healthDangerTimer > 5000) {
+      isSOS = true;
+    }
+  } else {
+    healthDangerTimer = 0; 
+  }
+
+  if (isSOS || isFalling) {
+    if (millis() - lastBeepTime > 200) { 
+      lastBeepTime = millis();
+      buzzerState = !buzzerState;
+      digitalWrite(BUZZER_PIN, buzzerState ? LOW : HIGH); 
+    }
+  } else {
+    digitalWrite(BUZZER_PIN, HIGH); 
+    buzzerState = false;
+  }
 }
 
 // ===================== CÁC HÀM XỬ LÝ DỮ LIỆU =====================
@@ -284,15 +352,11 @@ void addSpO2Value(int value) {
 int getFilteredBPM() { return getMedian(bpmHistory, bpmCount); }
 int getFilteredSpO2() { return getMedian(spo2History, spo2Count); }
 
-void displayInfo() {
-  if (gps.location.isValid()) {
-    // Thu gọn hàm GPS để tránh giật lag Serial
-  }
-}
-
+// ===================== KHOI TAO MAX30102 =====================
 bool initMAX30102() {
   if (!particleSensor.begin(Wire, I2C_SPEED_STANDARD)) {
-    Serial.println("MAX30102 not found."); return false;
+    Serial.println("MAX30102 not found.");
+    return false;
   }
   particleSensor.setup(60, 4, 2, 100, 411, 4096);
   particleSensor.setPulseAmplitudeRed(0x1F);
@@ -304,29 +368,60 @@ bool initMAX30102() {
 void initMAX30102Buffer() {
   if (!max30102Found) return;
   for (byte i = 0; i < 100; i++) {
-    while (particleSensor.available() == false) particleSensor.check();
+    long start = millis();
+    while (particleSensor.available() == false) {
+      particleSensor.check();
+      if (millis() - start > 100) break; 
+      delay(1); 
+    }
     redBuffer[i] = particleSensor.getRed();
     irBuffer[i] = particleSensor.getIR();
     particleSensor.nextSample();
   }
-  maxim_heart_rate_and_oxygen_saturation(irBuffer, bufferLength, redBuffer, &spo2, &validSPO2, &heartRateValue, &validHeartRate);
 }
 
+// ===================== CẬP NHẬT CẢM BIẾN NHỊP TIM =====================
 void updateMAX30102Fast() {
   if (!max30102Found) return;
+
   for (byte i = 25; i < 100; i++) {
     redBuffer[i - 25] = redBuffer[i];
     irBuffer[i - 25] = irBuffer[i];
   }
+
   for (byte i = 75; i < 100; i++) {
-    while (particleSensor.available() == false) particleSensor.check();
+    long start = millis();
+    while (particleSensor.available() == false) {
+      particleSensor.check();
+      if (millis() - start > 100) break;
+      delay(1); 
+    }
     redBuffer[i] = particleSensor.getRed();
     irBuffer[i] = particleSensor.getIR();
     particleSensor.nextSample();
   }
+
+  // NẾU RÚT TAY RA: Reset tiến trình và xóa dữ liệu cũ
+  if (irBuffer[99] < 50000) {
+    bpmCount = 0;   
+    spo2Count = 0;  
+    measurementProgress = 0; 
+    return;         
+  }
+
   maxim_heart_rate_and_oxygen_saturation(irBuffer, bufferLength, redBuffer, &spo2, &validSPO2, &heartRateValue, &validHeartRate);
-  if (validHeartRate && heartRateValue >= 50 && heartRateValue <= 120) addBPMValue(heartRateValue);
-  if (validSPO2 && spo2 >= 80 && spo2 <= 100) addSpO2Value(spo2);
+
+  // NẾU TÍN HIỆU TỐT: Lưu kết quả và đặt tiến trình 100%
+  if (validHeartRate && heartRateValue >= 50 && heartRateValue <= 120 && validSPO2 && spo2 >= 80 && spo2 <= 100) {
+    addBPMValue(heartRateValue);
+    addSpO2Value(spo2);
+    measurementProgress = 100; 
+  } else {
+    // ĐANG TÍNH TOÁN: Tăng % giả lập để tạo thanh tiến trình chờ
+    if (measurementProgress < 95) {
+      measurementProgress += 20; 
+    }
+  }
 }
 
 // ===================== SETUP =====================
@@ -335,21 +430,29 @@ void setup()
   Serial.begin(115200);
   delay(1000);
 
-  pinMode(TOUCH_PIN, INPUT);
+  pinMode(TOUCH_PIN, INPUT); 
+  attachInterrupt(digitalPinToInterrupt(TOUCH_PIN), touchISR, RISING); 
+
   pinMode(BUZZER_PIN, OUTPUT);
-  digitalWrite(BUZZER_PIN, LOW);
+  digitalWrite(BUZZER_PIN, HIGH); 
+  
   pinMode(DUST_LED_PIN, OUTPUT);
 
+  // ---------- KẾT NỐI WIFI ----------
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
   while (WiFi.status() != WL_CONNECTED) { delay(500); }
-  
+
   String mac = WiFi.macAddress();
   mac.replace(":", ""); 
   deviceID = "DEV_" + mac; 
 
+  // ---------- KẾT NỐI FIREBASE ----------
   config.api_key = API_KEY;
   config.database_url = DATABASE_URL;
-  if (Firebase.signUp(&config, &auth, "", "")) signupOK = true;
+  auth.user.email = "esp32@gmail.com";
+  auth.user.password = "12345678";
+  signupOK = true; 
+
   config.token_status_callback = tokenStatusCallback; 
   Firebase.begin(&config, &auth);
   Firebase.reconnectWiFi(true);
@@ -357,12 +460,15 @@ void setup()
   Wire.begin(SDA_PIN, SCL_PIN);
 
   initTFT(); 
+
   max30102Found = initMAX30102();
   if(max30102Found) initMAX30102Buffer();
+
   mpu6050.begin();
   mpu6050.calcGyroOffsets(true);
+
   mlx.begin();
-  ss.begin(GPSBaud);
+  gpsSerial.begin(GPSBaud, SERIAL_8N1, RXPin, TXPin);
 
   currentTempObj = mlx.readObjectTempC();
   currentTempAmb = mlx.readAmbientTempC();
@@ -372,13 +478,13 @@ void setup()
 
   drawStaticUI(); 
 
-  xTaskCreatePinnedToCore(TaskFirebase, "FirebaseTask", 10000, NULL, 1, &FirebaseTaskHandle, 0);                    
+  xTaskCreatePinnedToCore(TaskFirebase, "FirebaseTask", 16384, NULL, 1, &FirebaseTaskHandle, 0);                    
 }
 
-// ===================== LOOP (Core 1) =====================
+// ===================== LOOP (Chạy trên Core 1) =====================
 void loop()
 {
-  while (ss.available() > 0) { gps.encode(ss.read()); }
+  while (gpsSerial.available() > 0) { gps.encode(gpsSerial.read()); }
 
   mpu6050.update();
   updateMAX30102Fast(); 
@@ -398,49 +504,57 @@ void loop()
     Serial.println("=============== DU LIEU CAM BIEN ===============");
     Serial.println("ID THIẾT BỊ: " + deviceID);
     
-    Serial.print("MAX30102 -> BPM: "); Serial.print(bpmCount > 0 ? getFilteredBPM() : 0);
-    Serial.print(" | SpO2: "); Serial.println(spo2Count > 0 ? getFilteredSpO2() : 0);
+    Serial.print("MAX30102 -> Status: ");
+    if (measurementProgress == 0) Serial.println("No Finger");
+    else if (measurementProgress < 100) { Serial.print("Measuring "); Serial.print(measurementProgress); Serial.println("%"); }
+    else {
+      Serial.print("BPM: "); Serial.print(getFilteredBPM());
+      Serial.print(" | SpO2: "); Serial.println(getFilteredSpO2());
+    }
 
     Serial.printf("MPU6050  -> X: %.1f Y: %.1f Z: %.1f\n", currentMpuX, currentMpuY, currentMpuZ);
     Serial.printf("MLX90614 -> Obj: %.1f*C | Amb: %.1f*C\n", currentTempObj, currentTempAmb);
     Serial.printf("Dust     -> %.2f mg/m3\n", currentDust);
 
-    if (isSOS) Serial.println(">>> CANH BAO: SOS ACTIVE! <<<");
-    if (isFalling) Serial.println(">>> CANH BAO: TE NGA! <<<");
-    Serial.println("================================================");
-
     updateTFT();
   }
+  
+  delay(10); 
 }
 
-// ===================== TASK FIREBASE (Core 0) =====================
+// ===================== TASK FIREBASE (Chạy ngầm trên Core 0) =====================
 void TaskFirebase(void *pvParameters)
 {
   for (;;)
   {
     if (Firebase.ready() && signupOK) 
     {
-      int currentBPM = (bpmCount > 0) ? getFilteredBPM() : 0;
-      int currentSpO2 = (spo2Count > 0) ? getFilteredSpO2() : 0;
+      // Nếu đo xong mới lấy dữ liệu, chưa xong thì gửi 0 lên App
+      int currentBPM = (measurementProgress == 100 && bpmCount > 0) ? getFilteredBPM() : 0;
+      int currentSpO2 = (measurementProgress == 100 && spo2Count > 0) ? getFilteredSpO2() : 0;
+
       String basePath = "Devices/" + deviceID + "/";
 
-      Firebase.RTDB.setInt(&fbdo, basePath + "BPM", currentBPM);
-      Firebase.RTDB.setInt(&fbdo, basePath + "SpO2", currentSpO2);
-      Firebase.RTDB.setFloat(&fbdo, basePath + "TempObj", currentTempObj);
-      Firebase.RTDB.setFloat(&fbdo, basePath + "TempAmb", currentTempAmb);
-      Firebase.RTDB.setFloat(&fbdo, basePath + "AngleX", currentMpuX);
-      Firebase.RTDB.setFloat(&fbdo, basePath + "AngleY", currentMpuY);
-      Firebase.RTDB.setFloat(&fbdo, basePath + "AngleZ", currentMpuZ);
-      Firebase.RTDB.setFloat(&fbdo, basePath + "Dust", currentDust);
-
-      Firebase.RTDB.setBool(&fbdo, basePath + "Alert_SOS", isSOS);
-      Firebase.RTDB.setBool(&fbdo, basePath + "Alert_Fall", isFalling);
+      FirebaseJson json;
+      json.set("BPM", currentBPM);
+      json.set("SpO2", currentSpO2);
+      json.set("TempObj", currentTempObj);
+      json.set("TempAmb", currentTempAmb);
+      json.set("AngleX", currentMpuX);
+      json.set("AngleY", currentMpuY);
+      json.set("AngleZ", currentMpuZ);
+      json.set("Dust", currentDust);
+      json.set("Alert_SOS", isSOS);
+      json.set("Alert_Fall", isFalling);
 
       if (gps.location.isValid()) {
-        Firebase.RTDB.setFloat(&fbdo, basePath + "GPS_Lat", gps.location.lat());
-        Firebase.RTDB.setFloat(&fbdo, basePath + "GPS_Lng", gps.location.lng());
+        json.set("GPS_Lat", gps.location.lat());
+        json.set("GPS_Lng", gps.location.lng());
       }
+
+      Firebase.RTDB.setJSON(&fbdo, basePath, &json);
     }
+    
     vTaskDelay(pdMS_TO_TICKS(1500));
   }
 }
