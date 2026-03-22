@@ -36,13 +36,9 @@
 #include <WebServer.h>
 #include <ESPmDNS.h>
 
-// ===================== KHOA API =====================
-#define FIREBASE_API_KEY "AIzaSyAIe3PXUt2egCBYdS_UJOGRPQjiipEMoug"
-#define DATABASE_URL "cssuckhoe-default-rtdb.asia-southeast1.firebasedatabase.app"
-
-#define WEATHER_API_KEY "5f3f74bb8c79a340a99581f78a3ffc80"
-#define LAT "10.83229"
-#define LON "106.72566"
+// ===================== KHOA API BẢO MẬT =====================
+// Nhúng file secrets.h chứa các mã API (File này đã bị chặn up lên GitHub)
+#include "secrets.h"
 
 String weatherURL = "http://api.openweathermap.org/data/2.5/forecast?lat=" LAT "&lon=" LON "&appid=" WEATHER_API_KEY "&units=metric&cnt=2&lang=vi";
 JSONVar weatherData;
@@ -376,7 +372,7 @@ void handleTouchToggle() {
         isFalling = false; 
         isSOS = false; 
         isHealthAlert = false;
-        healthAlertReason = ""; // XÓA BỎ LÝ DO KHI MUTE
+        healthAlertReason = ""; 
         lastBPM = 0;   
         lastSpO2 = 0;  
       } else { 
@@ -416,12 +412,12 @@ void handleTouchToggle() {
     if (healthDangerTimer == 0) healthDangerTimer = millis(); 
     if (millis() - healthDangerTimer > 3000) {
       isHealthAlert = true; 
-      healthAlertReason = currentReason; // Chốt lý do gửi lên App
+      healthAlertReason = currentReason;
     }
   } else { 
     healthDangerTimer = 0; 
     isHealthAlert = false; 
-    healthAlertReason = ""; // Tẩy trắng lý do khi mọi thứ bình thường
+    healthAlertReason = ""; 
   }
   // ===========================================================
 
@@ -795,7 +791,7 @@ void TaskFirebase(void *pvParameters) {
       json.set("Alert_SOS", isSOS); 
       json.set("Alert_Fall", isFalling);
       json.set("Alert_Health", isHealthAlert); 
-      json.set("Alert_Reason", healthAlertReason); // <-- Dữ liệu lý do bóc tách cho App Android
+      json.set("Alert_Reason", healthAlertReason); 
       
       json.set("LastMeasureTime", lastMeasureTimeStr);
       json.set("TrangThai", currentStatus);
