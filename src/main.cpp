@@ -2,6 +2,7 @@
 #include <Wire.h>
 #include <WiFi.h>
 
+// ===================== CAM BIEN SUC KHOE & MOI TRUONG =====================
 #include "MAX30105.h"
 #include "heartRate.h"
 #include "spo2_algorithm.h"
@@ -10,393 +11,182 @@
 #include <TinyGPSPlus.h>
 #include <HardwareSerial.h> 
 
-// ===================== THEM THU VIEN TFT =====================
+// ===================== TFT & QR CODE =====================
 #include <SPI.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_ST7789.h>
+#include "all_frames.h" // FILE ANIMATION
+#include "qrcode.h"
+
+// DINH NGHIA MAU SAC MOI
+#define ST77XX_ORANGE 0xFD20
+#define ST77XX_DARKBLUE 0x01E8
+#define ST77XX_DARKGREEN 0x03E0
+#define ST77XX_GRAY 0x8410
 
 // ===================== FIREBASE =====================
 #include <Firebase_ESP_Client.h>
 #include "addons/TokenHelper.h"
 #include "addons/RTDBHelper.h"
 
-// THONG TIN CUA BAN
-#define WIFI_SSID "CV_RoboticX7.6"
-#define WIFI_PASSWORD "J4e4muVG"
+// ===================== WIFI MANAGER & WEB & THOI TIET =====================
+#include <HTTPClient.h>
+#include <Arduino_JSON.h>
+#include <WiFiManager.h>
+#include <WebServer.h>
+#include <ESPmDNS.h>
 
-#define API_KEY "AIzaSyBWnQQgUCFiZdGZNO2OJHSnOf7zTCSZZvE"
-#define DATABASE_URL "healthycaresystems-default-rtdb.firebaseio.com"
+// ===================== KHOA API =====================
+#define FIREBASE_API_KEY "AIzaSyAIe3PXUt2egCBYdS_UJOGRPQjiipEMoug"
+#define DATABASE_URL "cssuckhoe-default-rtdb.asia-southeast1.firebasedatabase.app"
+
+#define WEATHER_API_KEY "5f3f74bb8c79a340a99581f78a3ffc80"
+#define LAT "10.83229"
+#define LON "106.72566"
+
+String weatherURL = "http://api.openweathermap.org/data/2.5/forecast?lat=" LAT "&lon=" LON "&appid=" WEATHER_API_KEY "&units=metric&cnt=2&lang=vi";
+JSONVar weatherData;
+bool weatherValid = false;
+String customText = "";
+
+WebServer server(80);
 
 FirebaseData fbdo;
 FirebaseAuth auth;
 FirebaseConfig config;
 bool signupOK = false;
-
-// ===================== BIẾN LƯU MÃ THIẾT BỊ =====================
 String deviceID = "";
 TaskHandle_t FirebaseTaskHandle;
 
 // ===================== KHAI BÁO CHÂN PHẦN CỨNG =====================
 #define DUST_VO_PIN  34   
-#define DUST_LED_PIN 5    
+#define DUST_LED_PIN 14    
 #define TOUCH_PIN    13   
 #define BUZZER_PIN   15   
+#define SDA_PIN      21
+#define SCL_PIN      22
 
-// ===================== KHAI BAO CAM BIEN =====================
+#define TFT_CS   27
+#define TFT_DC   4
+#define TFT_RST  16
+Adafruit_ST7789 tft = Adafruit_ST7789(TFT_CS, TFT_DC, TFT_RST);
+
+static const int RXPin = 26, TXPin = 25;
+static const uint32_t GPSBaud = 9600;
+TinyGPSPlus gps;
+HardwareSerial gpsSerial(2); 
+
 MAX30105 particleSensor;
 MPU6050 mpu6050(Wire);
 Adafruit_MLX90614 mlx = Adafruit_MLX90614();
 
-// ===================== GPS (HardwareSerial) =====================
-static const int RXPin = 26, TXPin = 25;
-static const uint32_t GPSBaud = 9600;
-
-TinyGPSPlus gps;
-HardwareSerial gpsSerial(2); 
-
-// ===================== I2C ESP32 =====================
-#define SDA_PIN 21
-#define SCL_PIN 22
-
-// ===================== THOI GIAN IN & BIẾN CỜ =====================
+// ===================== BIẾN TOÀN CỤC =====================
 unsigned long lastPrintSensor = 0;
 const unsigned long sensorInterval = 500; 
+unsigned long lastWeatherUpdate = 0;
+const unsigned long weatherInterval = 300000; 
 
-float currentTempObj = 0.0;
-float currentTempAmb = 0.0;
-float currentMpuX = 0.0;
-float currentMpuY = 0.0;
-float currentMpuZ = 0.0;
+float currentTempObj = 0.0, currentTempAmb = 0.0;
+float currentMpuX = 0.0, currentMpuY = 0.0, currentMpuZ = 0.0;
 float currentDust = 0.0;
+bool isSOS = false, isFalling = false, isHealthAlert = false; 
 
-bool isSOS = false;
-bool isFalling = false;
+// THÊM BIẾN LƯU LÝ DO CẢNH BÁO
+String healthAlertReason = ""; 
 
-const float ALPHA_TEMP = 0.2; 
-const float ALPHA_MPU = 0.3;
+unsigned long healthDangerTimer = 0; 
+unsigned long lastBeepTime = 0;
+bool buzzerState = false;
 
-// ===================== THỜI GIAN THỰC TỪ GPS =====================
 String currentTimeStr = "--:--:-- --/--/----";
 String lastMeasureTimeStr = "Chua do";
+String currentStatus = "BINH THUONG"; 
 
-// ===================== MAX30102 & TIẾN TRÌNH ĐO =====================
+// BIEN DO NHIP TIM & TIEN TRINH
 uint32_t irBuffer[100];
 uint32_t redBuffer[100];
-int32_t bufferLength = 100;
-
 int32_t spo2 = 0;
 int8_t validSPO2 = 0;
 int32_t heartRateValue = 0;
 int8_t validHeartRate = 0;
-
 bool max30102Found = false;
+
+// Biến điều khiển độ sáng LED cho MAX30102
+byte currentLEDPower = 0x1F; 
+
 int measurementProgress = 0; 
+bool fingerPresent = false; 
+unsigned long measureCompleteTime = 0; 
+
+// Bộ đếm lọc rác và chốt mẫu
+int validSamplesCollected = 0;
+int ignoredSamples = 0;
+const int SAMPLES_TO_IGNORE = 2; 
+const int TARGET_SAMPLES = 3;    
+
+// CÁC BIẾN LƯU DỮ LIỆU CUỐI CÙNG CHỐT LẠI SAU KHI ĐO 100%
+int lastBPM = 0;
+int lastSpO2 = 0;
 
 const int FILTER_SIZE = 7;
-int bpmHistory[FILTER_SIZE] = {0};
-int spo2History[FILTER_SIZE] = {0};
-int bpmCount = 0;
-int spo2Count = 0;
-int bpmIndex = 0;
-int spo2Index = 0;
+int bpmHistory[FILTER_SIZE] = {0}, spo2History[FILTER_SIZE] = {0};
+int bpmCount = 0, spo2Count = 0;
+int bpmIndex = 0, spo2Index = 0;
 
-int currentScreen = 0;
+int userScreenIndex = 0; 
+int currentScreen = 0; 
 int lastScreen = -1;
+unsigned long lastAnimFrame = 0;
+int currentFrame = 0;
+#define FRAME_DELAY 42
 
-// ===================== BIẾN NGẮT NÚT NHẤN =====================
-volatile bool touchDetected = false;
+// ===================== XỬ LÝ NÚT CHẠM =====================
+volatile unsigned long touchStartTime = 0;
+volatile bool isPressed = false;
+volatile bool shortPressTriggered = false;
 
 void IRAM_ATTR touchISR() {
-  touchDetected = true; 
-}
-
-// ===================== BIẾN CÒI & CẢNH BÁO TỰ ĐỘNG =====================
-unsigned long lastBeepTime = 0;
-bool buzzerState = false;
-unsigned long healthDangerTimer = 0; 
-
-// ===================== TFT ST7789 =====================
-#define TFT_CS   27
-#define TFT_DC   4
-#define TFT_RST  16
-
-Adafruit_ST7789 tft = Adafruit_ST7789(TFT_CS, TFT_DC, TFT_RST);
-
-// ===================== KHAI BAO NGUYEN MAU HAM =====================
-void sortArray(int *arr, int size);
-int getMedian(int *data, int size);
-void addBPMValue(int value);
-void addSpO2Value(int value);
-int getFilteredBPM();
-int getFilteredSpO2();
-bool initMAX30102();
-void initMAX30102Buffer();
-void updateMAX30102Fast();
-void updateDustSensor();
-void checkAlarmsAndButtons();
-void updateGPSTime();
-void initTFT();
-void drawStaticUI();
-void drawMeasuringUI();
-void updateTFT();
-void TaskFirebase(void *pvParameters); 
-
-// ===================== HAM HIEN THI TFT =====================
-void initTFT()
-{
-  tft.init(240, 280);   
-  tft.setRotation(2);   
-  tft.fillScreen(ST77XX_BLACK);
-
-  tft.setTextWrap(false);
-  tft.setTextColor(ST77XX_WHITE);
-  tft.setTextSize(2);
-  tft.setCursor(20, 20);
-  tft.println("HEALTH MONITOR");
-  tft.drawLine(0, 50, 240, 50, ST77XX_CYAN);
-  tft.setCursor(10, 70);
-  tft.println("Dang khoi dong...");
-}
-
-void drawStaticUI()
-{
-  tft.fillScreen(ST77XX_BLACK);
-  
-  tft.setTextColor(ST77XX_YELLOW);
-  tft.setTextSize(2);
-  tft.setCursor(20, 5);
-  tft.println("HEALTH MONITOR");
-
-  tft.setTextColor(ST77XX_CYAN);
-  tft.setTextSize(1);
-  tft.setCursor(20, 25);
-  tft.print("ID: ");
-  tft.println(deviceID);
-
-  tft.drawLine(0, 38, 240, 38, ST77XX_BLUE);
-
-  tft.setTextSize(2);
-  tft.setTextColor(ST77XX_GREEN);
-  tft.setCursor(10, 45); tft.print("BPM: ");
-  tft.setCursor(10, 70); tft.print("SpO2:");
-
-  tft.setTextColor(ST77XX_WHITE);
-  tft.setCursor(10, 100); tft.print("Obj: ");
-  tft.setCursor(10, 125); tft.print("Amb: ");
-  tft.setCursor(10, 150); tft.print("Dust:"); 
-
-  tft.setTextSize(1);
-  tft.setTextColor(ST77XX_CYAN);
-  tft.setCursor(10, 180); tft.print("X: ");
-  tft.setCursor(85, 180); tft.print("Y: ");
-  tft.setCursor(160, 180); tft.print("Z: ");
-
-  tft.setTextColor(ST77XX_MAGENTA);
-  tft.setCursor(10, 200); tft.print("GPS: ");
-
-  tft.drawLine(0, 230, 240, 230, ST77XX_BLUE);
-  tft.setTextSize(2);
-  tft.setTextColor(ST77XX_WHITE);
-  tft.setCursor(10, 242); tft.print("SYS:");
-}
-
-void drawMeasuringUI() {
-  tft.fillScreen(ST77XX_BLACK);
-  tft.drawRect(5, 5, 230, 270, ST77XX_CYAN);
-  
-  tft.setTextColor(ST77XX_YELLOW);
-  tft.setTextSize(2);
-  tft.setCursor(25, 20);
-  tft.print("DO NHIP TIM & O2");
-  
-  tft.drawLine(10, 45, 230, 45, ST77XX_CYAN);
-
-  tft.setTextColor(ST77XX_WHITE);
-  tft.setTextSize(1);
-  tft.setCursor(35, 240);
-  tft.print("* Vui long giu im ngon tay *");
-}
-
-void updateTFT()
-{
-  if (measurementProgress > 0 && measurementProgress < 100) {
-    currentScreen = 1;
+  if (digitalRead(TOUCH_PIN) == HIGH) {
+    touchStartTime = millis();
+    isPressed = true;
   } else {
-    currentScreen = 0; 
-  }
-
-  if (currentScreen != lastScreen) {
-    if (currentScreen == 0) drawStaticUI();
-    else drawMeasuringUI();
-    lastScreen = currentScreen;
-  }
-
-  // ============== MÀN HÌNH CHÍNH ==============
-  if (currentScreen == 0) {
-    tft.setTextSize(2);
-    
-    tft.setTextColor(ST77XX_GREEN, ST77XX_BLACK);
-    tft.setCursor(70, 45);
-    if (measurementProgress == 100 && bpmCount > 0 && getFilteredBPM() > 0) {
-      tft.printf("%-5d", getFilteredBPM());
-    } else {
-      tft.print("--   ");
-    }
-
-    tft.setCursor(80, 70);
-    if (measurementProgress == 100 && spo2Count > 0 && getFilteredSpO2() > 0) {
-      tft.printf("%d%%  ", getFilteredSpO2());
-    } else {
-      tft.print("--   ");
-    }
-
-    tft.setTextColor(ST77XX_WHITE, ST77XX_BLACK);
-    tft.setCursor(70, 100); tft.printf("%-6.1f C", currentTempObj);
-    tft.setCursor(70, 125); tft.printf("%-6.1f C", currentTempAmb);
-    tft.setCursor(70, 150); tft.printf("%-5.2f mg/m3", currentDust);
-
-    tft.setTextSize(1);
-    tft.setTextColor(ST77XX_CYAN, ST77XX_BLACK);
-    tft.setCursor(30, 180); tft.printf("%-5.0f", currentMpuX);
-    tft.setCursor(105, 180); tft.printf("%-5.0f", currentMpuY);
-    tft.setCursor(180, 180); tft.printf("%-5.0f", currentMpuZ);
-
-    tft.setTextColor(ST77XX_MAGENTA, ST77XX_BLACK);
-    if (gps.location.isValid()) {
-      tft.setCursor(50, 200); tft.print("OK        ");
-      tft.setCursor(10, 215); tft.printf("%-9.4f, %-9.4f", gps.location.lat(), gps.location.lng());
-    } else {
-      tft.setCursor(50, 200); tft.print("Waiting...");
-      tft.setCursor(10, 215); tft.print("                    "); 
-    }
-
-    tft.setTextSize(2);
-    tft.setCursor(65, 242);
-    if (isSOS) {
-      tft.setTextColor(ST77XX_RED, ST77XX_BLACK); tft.print("SOS ACTIVE! ");
-    } else if (isFalling) {
-      tft.setTextColor(ST77XX_RED, ST77XX_BLACK); tft.print("FALL DETECT!");
-    } else {
-      tft.setTextColor(ST77XX_GREEN, ST77XX_BLACK); tft.print("NORMAL      ");
-    }
-
-    // IN THỜI GIAN THỰC NHỎ BÊN DƯỚI SYS
-    tft.setTextSize(1);
-    tft.setTextColor(ST77XX_YELLOW, ST77XX_BLACK);
-    tft.setCursor(10, 265);
-    tft.print("Time: ");
-    tft.print(currentTimeStr);
-  } 
-  // ============== MÀN HÌNH ĐANG ĐO ==============
-  else {
-    tft.setTextSize(2);
-    tft.setCursor(20, 80);
-    tft.setTextColor(ST77XX_GREEN, ST77XX_BLACK); 
-    
-    if (measurementProgress < 30) tft.print("Lay mau song...    ");
-    else if (measurementProgress < 60) tft.print("Loc nhieu...       ");
-    else if (measurementProgress < 90) tft.print("Phan tich AI...    ");
-    else tft.print("Hoan tat!          ");
-
-    tft.drawRect(20, 120, 200, 25, ST77XX_WHITE);
-    int barWidth = (measurementProgress * 196) / 100;
-    tft.fillRect(22, 122, barWidth, 21, ST77XX_GREEN);
-
-    tft.setCursor(100, 160);
-    tft.setTextColor(ST77XX_WHITE, ST77XX_BLACK);
-    tft.printf("%-3d%%", measurementProgress);
-  }
-}
-
-// ===================== XỬ LÝ THỜI GIAN GPS (UTC+7) =====================
-void updateGPSTime() {
-  if (gps.time.isValid() && gps.date.isValid()) {
-    int h = gps.time.hour() + 7; // Chuyển sang giờ Việt Nam
-    int d = gps.date.day();
-    int m = gps.date.month();
-    int y = gps.date.year();
-    
-    // Xử lý đơn giản qua ngày
-    if (h >= 24) { 
-      h -= 24; 
-      d += 1; 
-      if (d > 31) { d = 1; m += 1; }
-      if (m > 12) { m = 1; y += 1; }
-    }
-    
-    char timeBuf[25];
-    sprintf(timeBuf, "%02d:%02d:%02d %02d/%02d/%04d", h, gps.time.minute(), gps.time.second(), d, m, y);
-    currentTimeStr = String(timeBuf);
-  }
-}
-
-// ===================== ĐỌC BỤI MỊN =====================
-void updateDustSensor() {
-  digitalWrite(DUST_LED_PIN, LOW);
-  delayMicroseconds(280);
-  int voMeasured = analogRead(DUST_VO_PIN);
-  delayMicroseconds(40);
-  digitalWrite(DUST_LED_PIN, HIGH);
-  
-  float voltage = voMeasured * (3.3 / 4095.0);
-  float calculatedDust = (voltage - 0.1) / 0.5;
-  if (calculatedDust < 0) calculatedDust = 0;
-  
-  currentDust = calculatedDust;
-}
-
-// ===================== TÉ NGÃ, NÚT BẤM, CÒI =====================
-void checkAlarmsAndButtons() {
-  if (touchDetected) {
-    touchDetected = false; 
-    static unsigned long lastTouchTime = 0;
-    if (millis() - lastTouchTime > 500) { 
-      if (isFalling || isSOS) {
-        isFalling = false;
-        isSOS = false;
-      } else {
-        isSOS = true;
+    if (isPressed) {
+      unsigned long duration = millis() - touchStartTime;
+      if (duration > 50 && duration < 600) {
+        shortPressTriggered = true; 
       }
-      lastTouchTime = millis();
     }
+    isPressed = false;
   }
+}
 
-  float accX = mpu6050.getAccX();
-  float accY = mpu6050.getAccY();
-  float accZ = mpu6050.getAccZ();
-  float svm = sqrt(pow(accX, 2) + pow(accY, 2) + pow(accZ, 2));
-  
-  if (svm > 2.5) {
-    isFalling = true;
-  }
+// ===================== KHOI TAO NGUYÊN MẪU HÀM =====================
+void updateTFT();
+void drawWeatherScreenStatic();
+void drawWeatherAnimationFrame();
+void drawMeasuringUI();
+void drawStaticUI();
+void drawQRScreen(); 
+void TaskFirebase(void *pvParameters);
 
-  int currentBPM = (measurementProgress == 100 && bpmCount > 0) ? getFilteredBPM() : 0;
-  int currentSpO2 = (measurementProgress == 100 && spo2Count > 0) ? getFilteredSpO2() : 0;
-  
-  bool isHealthDanger = false;
-  if (currentBPM > 0 && (currentBPM < 50 || currentBPM > 120)) isHealthDanger = true;
-  if (currentSpO2 > 0 && currentSpO2 < 90) isHealthDanger = true;
-  if (currentTempObj > 38.5 || (currentTempObj < 35.0 && currentTempObj > 30.0)) isHealthDanger = true;
-
-  if (isHealthDanger) {
-    if (healthDangerTimer == 0) healthDangerTimer = millis(); 
-    if (millis() - healthDangerTimer > 5000) {
-      isSOS = true;
-    }
-  } else {
-    healthDangerTimer = 0; 
-  }
-
-  if (isSOS || isFalling) {
-    if (millis() - lastBeepTime > 200) { 
-      lastBeepTime = millis();
-      buzzerState = !buzzerState;
-      digitalWrite(BUZZER_PIN, buzzerState ? LOW : HIGH); 
-    }
-  } else {
-    digitalWrite(BUZZER_PIN, HIGH); 
-    buzzerState = false;
-  }
+// ===================== BO LOC TIENG VIET =====================
+String removeAccents(String str) {
+  String s = str;
+  s.replace("á", "a"); s.replace("à", "a"); s.replace("ả", "a"); s.replace("ã", "a"); s.replace("ạ", "a");
+  s.replace("ă", "a"); s.replace("ắ", "a"); s.replace("ằ", "a"); s.replace("ẳ", "a"); s.replace("ẵ", "a"); s.replace("ặ", "a");
+  s.replace("â", "a"); s.replace("ấ", "a"); s.replace("ầ", "a"); s.replace("ẩ", "a"); s.replace("ẫ", "a"); s.replace("ậ", "a");
+  s.replace("đ", "d"); s.replace("Đ", "D");
+  s.replace("é", "e"); s.replace("è", "e"); s.replace("ẻ", "e"); s.replace("ẽ", "e"); s.replace("ẹ", "e");
+  s.replace("ê", "e"); s.replace("ế", "e"); s.replace("ề", "e"); s.replace("ể", "e"); s.replace("ễ", "e"); s.replace("ệ", "e");
+  s.replace("í", "i"); s.replace("ì", "i"); s.replace("ỉ", "i"); s.replace("ĩ", "i"); s.replace("ị", "i");
+  s.replace("ó", "o"); s.replace("ò", "o"); s.replace("ỏ", "o"); s.replace("õ", "o"); s.replace("ọ", "o");
+  s.replace("ô", "o"); s.replace("ố", "o"); s.replace("ồ", "o"); s.replace("ổ", "o"); s.replace("ỗ", "o"); s.replace("ộ", "o");
+  s.replace("ơ", "o"); s.replace("ớ", "o"); s.replace("ờ", "o"); s.replace("ở", "o"); s.replace("ỡ", "o"); s.replace("ợ", "o");
+  s.replace("ú", "u"); s.replace("ù", "u"); s.replace("ủ", "u"); s.replace("ũ", "u"); s.replace("ụ", "u");
+  s.replace("ư", "u"); s.replace("ứ", "u"); s.replace("ừ", "u"); s.replace("ử", "u"); s.replace("ữ", "u"); s.replace("ự", "u");
+  s.replace("ý", "y"); s.replace("ỳ", "y"); s.replace("ỷ", "y"); s.replace("ỹ", "y"); s.replace("ỵ", "y");
+  s.replace("_", " "); 
+  return s;
 }
 
 // ===================== CÁC HÀM XỬ LÝ DỮ LIỆU =====================
@@ -409,241 +199,613 @@ void sortArray(int *arr, int size) {
     }
   }
 }
-
 int getMedian(int *data, int size) {
   if (size <= 0) return 0;
   int temp[FILTER_SIZE];
   for (int i = 0; i < size; i++) temp[i] = data[i];
   sortArray(temp, size);
-  if (size % 2 == 1) return temp[size / 2];
-  else return (temp[size / 2 - 1] + temp[size / 2]) / 2;
+  return (size % 2 == 1) ? temp[size / 2] : (temp[size / 2 - 1] + temp[size / 2]) / 2;
 }
-
 void addBPMValue(int value) {
-  bpmHistory[bpmIndex] = value;
-  bpmIndex = (bpmIndex + 1) % FILTER_SIZE;
+  bpmHistory[bpmIndex] = value; bpmIndex = (bpmIndex + 1) % FILTER_SIZE;
   if (bpmCount < FILTER_SIZE) bpmCount++;
 }
-
 void addSpO2Value(int value) {
-  spo2History[spo2Index] = value;
-  spo2Index = (spo2Index + 1) % FILTER_SIZE;
+  spo2History[spo2Index] = value; spo2Index = (spo2Index + 1) % FILTER_SIZE;
   if (spo2Count < FILTER_SIZE) spo2Count++;
 }
-
 int getFilteredBPM() { return getMedian(bpmHistory, bpmCount); }
 int getFilteredSpO2() { return getMedian(spo2History, spo2Count); }
 
-// ===================== KHOI TAO MAX30102 =====================
+// ===================== XỬ LÝ CẢM BIẾN & THỜI GIAN =====================
 bool initMAX30102() {
-  if (!particleSensor.begin(Wire, I2C_SPEED_STANDARD)) {
-    Serial.println("MAX30102 not found.");
-    return false;
-  }
+  if (!particleSensor.begin(Wire, I2C_SPEED_STANDARD)) return false;
   particleSensor.setup(60, 4, 2, 100, 411, 4096);
-  particleSensor.setPulseAmplitudeRed(0x1F);
-  particleSensor.setPulseAmplitudeIR(0x1F);
+  currentLEDPower = 0x1F; 
+  particleSensor.setPulseAmplitudeRed(currentLEDPower);
+  particleSensor.setPulseAmplitudeIR(currentLEDPower);
   particleSensor.setPulseAmplitudeGreen(0);
   return true;
 }
 
-void initMAX30102Buffer() {
-  if (!max30102Found) return;
-  for (byte i = 0; i < 100; i++) {
-    long start = millis();
-    while (particleSensor.available() == false) {
-      particleSensor.check();
-      if (millis() - start > 100) break; 
-      delay(1); 
-    }
-    redBuffer[i] = particleSensor.getRed();
-    irBuffer[i] = particleSensor.getIR();
-    particleSensor.nextSample();
-  }
-}
-
-// ===================== CẬP NHẬT CẢM BIẾN NHỊP TIM =====================
 void updateMAX30102Fast() {
   if (!max30102Found) return;
-
+  
   for (byte i = 25; i < 100; i++) {
-    redBuffer[i - 25] = redBuffer[i];
-    irBuffer[i - 25] = irBuffer[i];
+    redBuffer[i - 25] = redBuffer[i]; irBuffer[i - 25] = irBuffer[i];
   }
-
   for (byte i = 75; i < 100; i++) {
     long start = millis();
-    while (particleSensor.available() == false) {
-      particleSensor.check();
-      if (millis() - start > 100) break;
-      delay(1); 
-    }
-    redBuffer[i] = particleSensor.getRed();
-    irBuffer[i] = particleSensor.getIR();
+    while (!particleSensor.available() && millis() - start < 100) { particleSensor.check(); delay(1); }
+    redBuffer[i] = particleSensor.getRed(); irBuffer[i] = particleSensor.getIR();
     particleSensor.nextSample();
   }
 
   if (irBuffer[99] < 50000) {
-    bpmCount = 0;   
-    spo2Count = 0;  
-    measurementProgress = 0; 
-    return;         
-  }
+    if (fingerPresent) {
+      fingerPresent = false;
+      measurementProgress = 0; 
+      bpmCount = 0; spo2Count = 0;
+      bpmIndex = 0; spo2Index = 0;
+      validSamplesCollected = 0;
+      ignoredSamples = 0;
+      lastScreen = -1; 
 
-  maxim_heart_rate_and_oxygen_saturation(irBuffer, bufferLength, redBuffer, &spo2, &validSPO2, &heartRateValue, &validHeartRate);
-
-  if (measurementProgress < 95) {
-      measurementProgress += 10; 
-  }
-
-  if (validHeartRate && heartRateValue >= 50 && heartRateValue <= 120 && validSPO2 && spo2 >= 80 && spo2 <= 100) {
-    addBPMValue(heartRateValue);
-    addSpO2Value(spo2);
-    
-    // LƯU LOG THỜI GIAN KHI ĐO THÀNH CÔNG 100%
-    if (measurementProgress != 100) { 
-      measurementProgress = 100; 
-      lastMeasureTimeStr = currentTimeStr; 
-      Serial.println("=> LOG: Do nhip tim thanh cong vao luc: " + lastMeasureTimeStr);
+      if (currentLEDPower != 0x1F) {
+        currentLEDPower = 0x1F;
+        particleSensor.setPulseAmplitudeRed(currentLEDPower);
+        particleSensor.setPulseAmplitudeIR(currentLEDPower);
+      }
     }
+    return;        
+  }
+
+  if (!fingerPresent) {
+    fingerPresent = true;
+    bpmCount = 0; spo2Count = 0; 
+    bpmIndex = 0; spo2Index = 0;
+    validSamplesCollected = 0;
+    ignoredSamples = 0;
+    
+    int32_t currentIR = irBuffer[99];
+    if (currentIR < 80000) {
+      currentLEDPower = 0x3F; 
+    } else if (currentIR > 130000) {
+      currentLEDPower = 0x15; 
+    } else {
+      currentLEDPower = 0x1F; 
+    }
+    particleSensor.setPulseAmplitudeRed(currentLEDPower);
+    particleSensor.setPulseAmplitudeIR(currentLEDPower);
+
+    measurementProgress = 10;
+  }
+
+  maxim_heart_rate_and_oxygen_saturation(irBuffer, 100, redBuffer, &spo2, &validSPO2, &heartRateValue, &validHeartRate);
+  
+  if (validHeartRate && validSPO2 && spo2 >= 90 && spo2 <= 100) {
+    int currentBPM = heartRateValue;
+
+    if (currentBPM > 120 && currentBPM <= 160) {
+      currentBPM = currentBPM / 2;
+    }
+
+    if (currentBPM >= 50 && currentBPM <= 115) {
+      if (ignoredSamples < SAMPLES_TO_IGNORE) {
+        ignoredSamples++;
+      } else {
+        if (validSamplesCollected < TARGET_SAMPLES) {
+          addBPMValue(currentBPM); 
+          addSpO2Value(spo2);
+          validSamplesCollected++;
+          measurementProgress = 10 + (validSamplesCollected * 90 / TARGET_SAMPLES);
+
+          if (validSamplesCollected >= TARGET_SAMPLES) {
+            measurementProgress = 100;
+            measureCompleteTime = millis();
+            lastMeasureTimeStr = currentTimeStr; 
+            
+            lastBPM = getFilteredBPM(); 
+            lastSpO2 = getFilteredSpO2(); 
+          }
+        }
+      }
+    }
+  }
+
+  if (measurementProgress < 90 && fingerPresent) {
+    measurementProgress += 2; 
+  }
+}
+
+void updateDustSensor() {
+  digitalWrite(DUST_LED_PIN, LOW); 
+  delayMicroseconds(280);
+  int voMeasured = analogRead(DUST_VO_PIN);
+  delayMicroseconds(40); 
+  digitalWrite(DUST_LED_PIN, HIGH);
+  
+  float voltage = voMeasured * (3.3 / 4095.0);
+  float dustDensityMg = 0.17 * voltage - 0.1;
+  dustDensityMg = max(0.0f, dustDensityMg);
+  currentDust = dustDensityMg * 1000.0;
+}
+
+void updateGPSTime() {
+  if (gps.time.isValid() && gps.date.isValid()) {
+    int h = gps.time.hour() + 7; 
+    int d = gps.date.day(), m = gps.date.month(), y = gps.date.year();
+    if (h >= 24) { h -= 24; d += 1; if (d > 31) { d = 1; m += 1; } if (m > 12) { m = 1; y += 1; } }
+    char timeBuf[25];
+    sprintf(timeBuf, "%02d:%02d:%02d %02d/%02d/%04d", h, gps.time.minute(), gps.time.second(), d, m, y);
+    currentTimeStr = String(timeBuf);
+  }
+}
+
+// ===================== API THỜI TIẾT =====================
+void updateWeatherData() {
+  if (WiFi.status() != WL_CONNECTED) return;
+  HTTPClient http;
+  http.begin(weatherURL);
+  int httpResponseCode = http.GET();
+  if (httpResponseCode > 0) {
+    String payload = http.getString();
+    weatherData = JSON.parse(payload);
+    if (JSON.typeof(weatherData) != "undefined" && weatherData.hasOwnProperty("list")) {
+      weatherValid = true;
+    } else {
+      weatherValid = false;
+    }
+  }
+  http.end();
+}
+
+// ===================== XỬ LÝ NÚT NHẤN CHÍNH & CẢNH BÁO =====================
+void handleTouchToggle() {
+  if (shortPressTriggered) {
+    userScreenIndex = (userScreenIndex + 1) % 3; 
+    lastScreen = -1; 
+    updateTFT();
+    shortPressTriggered = false; 
+  }
+
+  static bool longPressHandled = false;
+  if (isPressed) {
+    if (!longPressHandled && (millis() - touchStartTime >= 600)) {
+      if (isFalling || isSOS || isHealthAlert) { 
+        isFalling = false; 
+        isSOS = false; 
+        isHealthAlert = false;
+        healthAlertReason = ""; // XÓA BỎ LÝ DO KHI MUTE
+        lastBPM = 0;   
+        lastSpO2 = 0;  
+      } else { 
+        isSOS = true; 
+      }
+      longPressHandled = true;
+      lastScreen = -1;
+      updateTFT();
+    }
+  } else {
+    longPressHandled = false;
+  }
+
+  if (sqrt(pow(mpu6050.getAccX(), 2) + pow(mpu6050.getAccY(), 2) + pow(mpu6050.getAccZ(), 2)) > 2.5) isFalling = true;
+  
+  // ================= BÓC TÁCH LOGIC CẢNH BÁO =================
+  bool danger = false;
+  String currentReason = "";
+
+  if (lastBPM > 0 && (lastBPM < 40 || lastBPM > 130)) {
+    danger = true;
+    currentReason += "Nhip tim bat thuong. ";
+  }
+  if (lastSpO2 > 0 && lastSpO2 < 92) {
+    danger = true;
+    currentReason += "Oxy mau (SpO2) thap. ";
+  }
+  if (currentTempObj > 37.5) {
+    danger = true;
+    currentReason += "Nhiet do cao (Sot). ";
+  } else if (currentTempObj > 25.0 && currentTempObj < 30.0) {
+    danger = true;
+    currentReason += "Nhiet do da qua thap. ";
+  }
+
+  if (danger) {
+    if (healthDangerTimer == 0) healthDangerTimer = millis(); 
+    if (millis() - healthDangerTimer > 3000) {
+      isHealthAlert = true; 
+      healthAlertReason = currentReason; // Chốt lý do gửi lên App
+    }
+  } else { 
+    healthDangerTimer = 0; 
+    isHealthAlert = false; 
+    healthAlertReason = ""; // Tẩy trắng lý do khi mọi thứ bình thường
+  }
+  // ===========================================================
+
+  if (isSOS || isFalling || isHealthAlert) {
+    if (millis() - lastBeepTime > 200) { 
+        lastBeepTime = millis(); 
+        buzzerState = !buzzerState; 
+        digitalWrite(BUZZER_PIN, buzzerState ? LOW : HIGH); 
+    }
+  } else { 
+    digitalWrite(BUZZER_PIN, HIGH); 
+    buzzerState = false; 
+  }
+}
+
+// ===================== GIAO DIỆN HIỂN THỊ TFT =====================
+void showBootScreen() {
+  tft.fillScreen(ST77XX_BLACK);
+  tft.setTextColor(ST77XX_CYAN); tft.setTextSize(2);
+  tft.setCursor(20, 120); tft.println("DANG KHOI DONG...");
+}
+
+void drawStaticUI() {
+  tft.fillScreen(ST77XX_BLACK);
+  
+  tft.fillRoundRect(0, 0, 240, 35, 0, ST77XX_DARKGREEN); 
+  tft.setTextColor(ST77XX_WHITE); tft.setTextSize(2); 
+  tft.setCursor(35, 10); tft.println("TRAM Y TE MINI");
+
+  tft.setTextSize(2); tft.setTextColor(ST77XX_ORANGE);
+  tft.setCursor(10, 55); tft.print("Nhip tim :"); 
+  tft.setTextColor(ST77XX_CYAN);
+  tft.setCursor(10, 95); tft.print("Oxy mau  :");
+  
+  tft.setTextSize(1); tft.setTextColor(ST77XX_WHITE);
+  tft.setCursor(10, 140); tft.print("Nhiet do co the:"); 
+  tft.setCursor(10, 170); tft.print("Nhiet do moi tr:"); 
+  tft.setCursor(10, 200); tft.print("Nong do bui min:"); 
+  
+  tft.drawLine(10, 225, 230, 225, ST77XX_GRAY);
+  
+  tft.setTextSize(1); tft.setTextColor(ST77XX_WHITE); 
+  tft.setCursor(10, 240); tft.print("Trang thai:");
+  tft.setCursor(10, 260); tft.print("Thoi gian :"); 
+}
+
+void drawMeasuringUI() {
+  tft.fillScreen(ST77XX_BLACK);
+  tft.drawRoundRect(10, 10, 220, 260, 10, ST77XX_CYAN);
+  tft.setTextColor(ST77XX_YELLOW); tft.setTextSize(2); 
+  tft.setCursor(20, 30); tft.print("DANG DO TIM MACH");
+  tft.drawLine(20, 60, 220, 60, ST77XX_CYAN);
+  tft.setTextColor(ST77XX_WHITE); tft.setTextSize(1); 
+  tft.setCursor(25, 240); tft.print("* Vui long dat im ngon tay *");
+}
+
+void drawWeatherScreenStatic() {
+  tft.fillScreen(ST77XX_BLACK);
+
+  tft.fillRoundRect(0, 0, 240, 35, 0, ST77XX_DARKBLUE);
+  tft.setTextColor(ST77XX_WHITE); 
+  tft.setTextSize(2);
+  tft.setCursor(18, 10); 
+  tft.print("THOI TIET TAI CHO");
+
+  if (!weatherValid) {
+    tft.setTextColor(ST77XX_RED); 
+    tft.setTextSize(1);
+    tft.setCursor(45, 120); 
+    tft.print("Dang cap nhat du lieu...");
+    return;
+  }
+
+  double curTemp = (double)weatherData["list"][0]["main"]["temp"];
+  int curHumi = (int)weatherData["list"][0]["main"]["humidity"];
+  String curDesc = removeAccents((const char*)weatherData["list"][0]["weather"][0]["description"]);
+  curDesc.toUpperCase();
+
+  tft.setTextColor(ST77XX_YELLOW); 
+  tft.setTextSize(4); 
+  tft.setCursor(15, 50); 
+  tft.print(curTemp, 1);
+  
+  int tempWidth = String(curTemp, 1).length() * 24;
+  tft.setTextSize(1); 
+  tft.setCursor(15 + tempWidth + 5, 50); 
+  tft.print("o"); 
+  tft.setTextSize(2); 
+  tft.setCursor(15 + tempWidth + 12, 55); 
+  tft.print("C");
+
+  tft.setTextColor(ST77XX_CYAN); 
+  tft.setTextSize(2);
+  tft.setCursor(15, 90); 
+  tft.print(curDesc);
+
+  tft.setTextColor(ST77XX_WHITE); 
+  tft.setTextSize(1);
+  tft.setCursor(15, 120); 
+  tft.printf("Do am khong khi: %d%%", curHumi);
+
+  tft.drawLine(15, 140, 225, 140, ST77XX_GRAY);
+
+  double nextTemp = (double)weatherData["list"][1]["main"]["temp"];
+  String nextDesc = removeAccents((const char*)weatherData["list"][1]["weather"][0]["description"]);
+  nextDesc.toUpperCase();
+
+  tft.fillRoundRect(15, 155, 210, 25, 4, ST77XX_DARKGREEN);
+  tft.setTextColor(ST77XX_WHITE); 
+  tft.setTextSize(1);
+  tft.setCursor(65, 163); 
+  tft.print("DU BAO 3 GIO TOI");
+
+  tft.setTextColor(ST77XX_MAGENTA); 
+  tft.setTextSize(3);
+  tft.setCursor(20, 195); 
+  tft.print(nextTemp, 1); 
+  
+  int nextTempWidth = String(nextTemp, 1).length() * 18;
+  tft.setTextSize(1); 
+  tft.setCursor(20 + nextTempWidth + 3, 195); 
+  tft.print("o");
+  tft.setTextSize(2); 
+  tft.setCursor(20 + nextTempWidth + 10, 200); 
+  tft.print("C");
+
+  tft.setTextColor(ST77XX_ORANGE); 
+  if (nextDesc.length() > 18) {
+    tft.setTextSize(1); 
+    tft.setCursor(20, 235);
+  } else {
+    tft.setTextSize(2); 
+    tft.setCursor(20, 235); 
+  }
+  tft.print(nextDesc);
+}
+
+void drawQRScreen() {
+  tft.fillScreen(ST77XX_WHITE); 
+
+  tft.fillRoundRect(0, 0, 240, 40, 0, ST77XX_DARKBLUE);
+  tft.setTextColor(ST77XX_WHITE); tft.setTextSize(2);
+  tft.setCursor(15, 12); tft.print("MA KET NOI (APP)");
+
+  QRCode qrcode;
+  uint8_t qrcodeData[qrcode_getBufferSize(3)]; 
+  qrcode_initText(&qrcode, qrcodeData, 3, 0, deviceID.c_str());
+
+  int scale = 6; 
+  int xOffset = (240 - qrcode.size * scale) / 2;
+  int yOffset = (280 - qrcode.size * scale) / 2 + 15;
+
+  for (uint8_t y = 0; y < qrcode.size; y++) {
+    for (uint8_t x = 0; x < qrcode.size; x++) {
+      if (qrcode_getModule(&qrcode, x, y)) {
+        tft.fillRect(xOffset + x * scale, yOffset + y * scale, scale, scale, ST77XX_BLACK);
+      }
+    }
+  }
+
+  tft.setTextColor(ST77XX_BLACK); tft.setTextSize(1);
+  tft.setCursor((240 - (10 * 6 + deviceID.length() * 6)) / 2, 260); 
+  tft.print("DeviceID: "); tft.print(deviceID);
+}
+
+void drawWeatherAnimationFrame() {
+  int frameX = 145; 
+  int frameY = 50; 
+  tft.drawBitmap(frameX, frameY, frames[currentFrame], FRAME_WIDTH, FRAME_HEIGHT, ST77XX_WHITE);
+  currentFrame = (currentFrame + 1) % TOTAL_FRAMES;
+}
+
+void updateTFT() {
+  if (measurementProgress > 0) {
+    if (measurementProgress < 100) {
+      currentScreen = 1; 
+    } else {
+      if (millis() - measureCompleteTime < 1500) {
+        currentScreen = 1; 
+      } else {
+        currentScreen = (userScreenIndex == 0) ? 0 : ((userScreenIndex == 1) ? 2 : 3);
+      }
+    }
+  } else {
+    currentScreen = (userScreenIndex == 0) ? 0 : ((userScreenIndex == 1) ? 2 : 3);
+  }
+
+  if (currentScreen != lastScreen) {
+    if (currentScreen == 0) drawStaticUI();
+    else if (currentScreen == 1) drawMeasuringUI();
+    else if (currentScreen == 2) drawWeatherScreenStatic();
+    else if (currentScreen == 3) drawQRScreen();
+    lastScreen = currentScreen;
+  }
+
+  if (currentScreen == 0) { 
+    tft.setTextSize(3); tft.setTextColor(ST77XX_YELLOW, ST77XX_BLACK);
+    
+    tft.setCursor(140, 50); 
+    (lastBPM > 0) ? tft.printf("%-4d", lastBPM) : tft.print("--  ");
+    
+    tft.setCursor(140, 90); 
+    if (lastSpO2 > 0) {
+      tft.printf("%d%%  ", lastSpO2);
+    } else {
+      tft.print("--  ");
+    }
+    
+    tft.setTextSize(2); tft.setTextColor(ST77XX_WHITE, ST77XX_BLACK);
+    tft.setCursor(130, 135); tft.printf("%-5.1fC", currentTempObj);
+    tft.setCursor(130, 165); tft.printf("%-5.1fC", currentTempAmb);
+    
+    tft.setCursor(130, 195); 
+    tft.printf("%-4.0f", currentDust); 
+    tft.setTextSize(1); 
+    tft.print(" ug/m3  "); 
+    
+    tft.setTextSize(1); 
+    tft.setCursor(85, 240);
+    
+    if (isSOS) { 
+      tft.setTextColor(ST77XX_RED, ST77XX_BLACK); tft.print("BAO DONG KHOAN CAP! "); 
+      currentStatus = "SOS KHOAN CAP!";
+    } 
+    else if (isFalling) { 
+      tft.setTextColor(ST77XX_RED, ST77XX_BLACK); tft.print("PHAT HIEN TE NGA!   "); 
+      currentStatus = "PHAT HIEN TE NGA!";
+    } 
+    else if (isHealthAlert) { 
+      tft.setTextColor(ST77XX_ORANGE, ST77XX_BLACK); tft.print("CANH BAO SUC KHOE!  "); 
+      currentStatus = "CANH BAO SUC KHOE!";
+    }
+    else { 
+      tft.setTextColor(ST77XX_GREEN, ST77XX_BLACK); tft.print("BINH THUONG         "); 
+      currentStatus = "BINH THUONG";
+    }
+    
+    tft.setTextColor(ST77XX_YELLOW, ST77XX_BLACK); 
+    tft.setCursor(85, 260); tft.print(currentTimeStr);
   } 
+  else if (currentScreen == 1) { 
+    tft.setTextSize(2); tft.setCursor(30, 90); tft.setTextColor(ST77XX_GREEN, ST77XX_BLACK); 
+    if (measurementProgress < 30) tft.print("Dang lay mau...   "); 
+    else if (measurementProgress < 60) tft.print("Dang loc nhieu... "); 
+    else if (measurementProgress < 90) tft.print("Phan tich du lieu."); 
+    else tft.print("Da hoan tat!      ");
+    
+    tft.drawRect(20, 140, 200, 25, ST77XX_WHITE);
+    tft.fillRect(22, 142, (measurementProgress * 196) / 100, 21, ST77XX_GREEN);
+    tft.setCursor(100, 180); tft.setTextColor(ST77XX_WHITE, ST77XX_BLACK); tft.printf("%-3d%%", measurementProgress);
+  }
+  else if (currentScreen == 2) { 
+    if (millis() - lastAnimFrame >= FRAME_DELAY) {
+      lastAnimFrame = millis();
+      drawWeatherAnimationFrame();
+    }
+  }
+}
+
+// ===================== WEB SERVER HANDLER =====================
+void handleRoot() {
+  String html = R"rawliteral(<!DOCTYPE html><html lang="vi"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>He Thong Giam Sat Y Te</title><style>body { font-family: sans-serif; text-align: center; background: #f4f4f4; padding: 20px; } button { padding: 10px 20px; background: #007bff; color: #fff; border-radius: 5px; border:none; }</style></head><body><h2>HE THONG GIAM SAT Y TE TRAM KHOANG CACH</h2><input type="text" id="oledText" placeholder="Nhap thong bao cho benh nhan"><button onclick="sendText()">Gui Len Man Hinh</button><script>function sendText() { fetch("/settext?msg=" + document.getElementById("oledText").value).then(() => alert("Da gui thanh cong!")); }</script></body></html>)rawliteral";
+  server.send(200, "text/html", html);
+}
+void handleData() {
+  String out = weatherValid ? "{\"temp\":" + String((double)weatherData["list"][0]["main"]["temp"], 1) + "}" : "{\"temp\":0}";
+  server.send(200, "application/json", out);
 }
 
 // ===================== SETUP =====================
-void setup()
-{
+void setup() {
   Serial.begin(115200);
-  delay(1000);
-
-  pinMode(TOUCH_PIN, INPUT); 
-  attachInterrupt(digitalPinToInterrupt(TOUCH_PIN), touchISR, RISING); 
-
-  pinMode(BUZZER_PIN, OUTPUT);
-  digitalWrite(BUZZER_PIN, HIGH); 
   
+  pinMode(TOUCH_PIN, INPUT); 
+  attachInterrupt(digitalPinToInterrupt(TOUCH_PIN), touchISR, CHANGE);
+  
+  pinMode(BUZZER_PIN, OUTPUT); digitalWrite(BUZZER_PIN, HIGH); 
   pinMode(DUST_LED_PIN, OUTPUT);
 
-  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
-  while (WiFi.status() != WL_CONNECTED) { delay(500); }
-
-  String mac = WiFi.macAddress();
-  mac.replace(":", ""); 
-  deviceID = "DEV_" + mac; 
-
-  config.api_key = API_KEY;
-  config.database_url = DATABASE_URL;
-  auth.user.email = "esp32@gmail.com";
-  auth.user.password = "12345678";
-  signupOK = true; 
-
-  config.token_status_callback = tokenStatusCallback; 
-  Firebase.begin(&config, &auth);
-  Firebase.reconnectWiFi(true);
-
   Wire.begin(SDA_PIN, SCL_PIN);
+  tft.init(240, 280); tft.setRotation(2); tft.setTextWrap(false);
+  showBootScreen();
 
-  initTFT(); 
+  WiFiManager wm;
+  wm.setConfigPortalTimeout(120); 
+  if(!wm.autoConnect("ESP32_Y_Te")) {
+    Serial.println("Chay Offline Mode (Khong co WiFi)");
+  }
+
+  String mac = WiFi.macAddress(); mac.replace(":", ""); deviceID = "DEV_" + mac; 
+
+  if (WiFi.status() == WL_CONNECTED) {
+    config.api_key = FIREBASE_API_KEY; config.database_url = DATABASE_URL;
+    auth.user.email = "esp32@gmail.com"; auth.user.password = "12345678";
+    signupOK = true; config.token_status_callback = tokenStatusCallback; 
+    Firebase.begin(&config, &auth); Firebase.reconnectWiFi(true);
+    updateWeatherData();
+  }
+
+  if (MDNS.begin("esp32")) Serial.println("mDNS: http://esp32.local");
+  server.on("/", handleRoot);
+  server.on("/data", handleData);
+  server.on("/settext", []() {
+    if (server.hasArg("msg")) customText = server.arg("msg");
+    if (currentScreen == 2) drawWeatherScreenStatic();
+    server.send(200, "text/plain", "OK");
+  });
+  server.begin();
 
   max30102Found = initMAX30102();
-  if(max30102Found) initMAX30102Buffer();
-
-  mpu6050.begin();
-  mpu6050.calcGyroOffsets(true);
-
+  mpu6050.begin(); mpu6050.calcGyroOffsets(true);
   mlx.begin();
   gpsSerial.begin(GPSBaud, SERIAL_8N1, RXPin, TXPin);
 
-  currentTempObj = mlx.readObjectTempC();
-  currentTempAmb = mlx.readAmbientTempC();
-  currentMpuX = mpu6050.getAngleX();
-  currentMpuY = mpu6050.getAngleY();
-  currentMpuZ = mpu6050.getAngleZ();
-
-  drawStaticUI(); 
-
   xTaskCreatePinnedToCore(TaskFirebase, "FirebaseTask", 16384, NULL, 1, &FirebaseTaskHandle, 0);                    
+  lastScreen = -1; 
 }
 
-// ===================== LOOP (Chạy trên Core 1) =====================
-void loop()
-{
-  while (gpsSerial.available() > 0) { 
-    gps.encode(gpsSerial.read()); 
-  }
+// ===================== LOOP =====================
+void loop() {
+  server.handleClient();
+  handleTouchToggle();
+  while (gpsSerial.available() > 0) gps.encode(gpsSerial.read()); 
   
-  updateGPSTime(); // Cập nhật đồng hồ liên tục
-
+  updateGPSTime();
   mpu6050.update();
   updateMAX30102Fast(); 
   updateDustSensor();       
-  checkAlarmsAndButtons();  
 
-  currentTempObj = (ALPHA_TEMP * mlx.readObjectTempC()) + ((1.0 - ALPHA_TEMP) * currentTempObj);
-  currentTempAmb = (ALPHA_TEMP * mlx.readAmbientTempC()) + ((1.0 - ALPHA_TEMP) * currentTempAmb);
-  currentMpuX = (ALPHA_MPU * mpu6050.getAngleX()) + ((1.0 - ALPHA_MPU) * currentMpuX);
-  currentMpuY = (ALPHA_MPU * mpu6050.getAngleY()) + ((1.0 - ALPHA_MPU) * currentMpuY);
-  currentMpuZ = (ALPHA_MPU * mpu6050.getAngleZ()) + ((1.0 - ALPHA_MPU) * currentMpuZ);
+  currentTempObj = (0.2 * mlx.readObjectTempC()) + (0.8 * currentTempObj);
+  currentTempAmb = (0.2 * mlx.readAmbientTempC()) + (0.8 * currentTempAmb);
+  currentMpuX = (0.3 * mpu6050.getAngleX()) + (0.7 * currentMpuX);
+  currentMpuY = (0.3 * mpu6050.getAngleY()) + (0.7 * currentMpuY);
+  currentMpuZ = (0.3 * mpu6050.getAngleZ()) + (0.7 * currentMpuZ);
 
-  if (millis() - lastPrintSensor >= sensorInterval)
-  {
+  if (millis() - lastWeatherUpdate >= weatherInterval) {
+    lastWeatherUpdate = millis();
+    updateWeatherData();
+    if (currentScreen == 2) drawWeatherScreenStatic(); 
+  }
+
+  if (millis() - lastPrintSensor >= sensorInterval) {
     lastPrintSensor = millis();
-
-    if (currentScreen == 0) {
-      Serial.println("=============== DU LIEU CAM BIEN ===============");
-      Serial.println("ID THIẾT BỊ: " + deviceID);
-      
-      Serial.print("MAX30102 -> BPM: "); Serial.print(getFilteredBPM());
-      Serial.print(" | SpO2: "); Serial.println(getFilteredSpO2());
-
-      Serial.printf("MPU6050  -> X: %.1f Y: %.1f Z: %.1f\n", currentMpuX, currentMpuY, currentMpuZ);
-      Serial.printf("MLX90614 -> Obj: %.1f*C | Amb: %.1f*C\n", currentTempObj, currentTempAmb);
-      Serial.printf("Dust     -> %.2f mg/m3\n", currentDust);
-      Serial.println("Time     -> " + currentTimeStr);
-    } else {
-      Serial.printf("=> DANG DO NHIP TIM... TIEN TRINH: %d%%\n", measurementProgress);
-    }
-
     updateTFT();
   }
-  
   delay(10); 
 }
 
-// ===================== TASK FIREBASE (Chạy ngầm trên Core 0) =====================
-void TaskFirebase(void *pvParameters)
-{
-  for (;;)
-  {
-    if (Firebase.ready() && signupOK) 
-    {
-      int currentBPM = (measurementProgress == 100 && bpmCount > 0) ? getFilteredBPM() : 0;
-      int currentSpO2 = (measurementProgress == 100 && spo2Count > 0) ? getFilteredSpO2() : 0;
-
+// ===================== TASK FIREBASE =====================
+void TaskFirebase(void *pvParameters) {
+  for (;;) {
+    if (Firebase.ready() && signupOK && WiFi.status() == WL_CONNECTED) {
+      int displayBPM = lastBPM;
+      int displaySpO2 = lastSpO2;
+      
+      String trangThaiDo = "Cho do";
+      if (fingerPresent) {
+        if (measurementProgress < 100) trangThaiDo = "Dang do...";
+        else trangThaiDo = "Hoan tat";
+      }
+      
       String basePath = "Devices/" + deviceID + "/";
 
       FirebaseJson json;
-      json.set("BPM", currentBPM);
-      json.set("SpO2", currentSpO2);
-      json.set("TempObj", currentTempObj);
-      json.set("TempAmb", currentTempAmb);
-      json.set("AngleX", currentMpuX);
-      json.set("AngleY", currentMpuY);
-      json.set("AngleZ", currentMpuZ);
-      json.set("Dust", currentDust);
-      json.set("Alert_SOS", isSOS);
-      json.set("Alert_Fall", isFalling);
+      json.set("BPM", displayBPM); 
+      json.set("SpO2", displaySpO2);
+      json.set("TempObj", currentTempObj); json.set("TempAmb", currentTempAmb);
+      json.set("AngleX", currentMpuX); json.set("AngleY", currentMpuY); json.set("AngleZ", currentMpuZ);
+      json.set("Dust", currentDust); 
       
-      // Đẩy thêm thời gian thực hiện đo nhịp tim gần nhất lên database
+      json.set("Alert_SOS", isSOS); 
+      json.set("Alert_Fall", isFalling);
+      json.set("Alert_Health", isHealthAlert); 
+      json.set("Alert_Reason", healthAlertReason); // <-- Dữ liệu lý do bóc tách cho App Android
+      
       json.set("LastMeasureTime", lastMeasureTimeStr);
+      json.set("TrangThai", currentStatus);
+      json.set("ThoiGian", currentTimeStr);
+      json.set("TrangThaiDo", trangThaiDo);
 
-      if (gps.location.isValid()) {
-        json.set("GPS_Lat", gps.location.lat());
-        json.set("GPS_Lng", gps.location.lng());
-      }
+      if (gps.location.isValid()) { json.set("GPS_Lat", gps.location.lat()); json.set("GPS_Lng", gps.location.lng()); }
 
       Firebase.RTDB.setJSON(&fbdo, basePath, &json);
     }
-    
     vTaskDelay(pdMS_TO_TICKS(1500));
   }
 }
