@@ -1,6 +1,7 @@
 #include <Arduino.h>
 #include <Wire.h>
 #include <WiFi.h>
+#include <time.h> // Thư viện hỗ trợ đồng bộ thời gian thực (NTP)
 
 // ===================== CAM BIEN SUC KHOE & MOI TRUONG =====================
 #include "MAX30105.h"
@@ -315,16 +316,31 @@ void updateMAX30102Fast() {
 }
 
 void updateDustSensor() {
-  digitalWrite(DUST_LED_PIN, LOW); 
-  delayMicroseconds(280);
-  int voMeasured = analogRead(DUST_VO_PIN);
-  delayMicroseconds(40); 
-  digitalWrite(DUST_LED_PIN, HIGH);
+  digitalWrite(DUST_LED_PIN, LOW); // Bật IR LED
+  delayMicroseconds(280);          // Delay 0.28ms
   
-  float voltage = voMeasured * (3.3 / 4095.0);
-  float dustDensityMg = 0.17 * voltage - 0.1;
-  dustDensityMg = max(0.0f, dustDensityMg);
-  currentDust = dustDensityMg * 1000.0;
+  int voMeasured = analogRead(DUST_VO_PIN); // Đọc giá trị ADC V0
+  
+  delayMicroseconds(40);           // Delay 0.04ms
+  digitalWrite(DUST_LED_PIN, HIGH); // Tắt LED
+  delayMicroseconds(9680);         // Delay 9.68ms (Thời gian nghỉ giống hệt code chuẩn)
+  
+  // Tính điện áp cho ESP32 (Hệ 3.3V, ADC 12-bit 4095)
+  float voltage = voMeasured * (3.3 / 4095.0); 
+  
+  // Công thức tuyến tính gốc của Chris Nafis: dustDensity = 0.17 * calcVoltage - 0.1
+  // Đổi đơn vị ra ug/m3 (nhân 1000)
+  float rawDustUg = ((0.17 * voltage) - 0.1) * 1000.0;
+  
+  if (rawDustUg < 0) {
+    rawDustUg = 0; // Không cho phép giá trị âm
+  }
+  
+  // Lọc nhiễu trung bình động
+  currentDust = (0.1 * rawDustUg) + (0.9 * currentDust);
+
+  // In thêm Raw ADC để bắt bệnh trên Serial Monitor
+  Serial.printf("Raw ADC: %d | Dien ap bui: %.2f V | Bui min: %.0f ug/m3\n", voMeasured, voltage, currentDust);
 }
 
 void updateGPSTime() {
@@ -398,14 +414,18 @@ void handleTouchToggle() {
   }
   if (lastSpO2 > 0 && lastSpO2 < 92) {
     danger = true;
-    currentReason += "Oxy mau (SpO2) thap. ";
+    currentReason += "SpO2 xuong thap. ";
   }
   if (currentTempObj > 37.5) {
     danger = true;
     currentReason += "Nhiet do cao (Sot). ";
   } else if (currentTempObj > 25.0 && currentTempObj < 30.0) {
     danger = true;
-    currentReason += "Nhiet do da qua thap. ";
+    currentReason += "Nhiet do qua thap. ";
+  }
+  if (currentDust > 100.0) {
+    danger = true;
+    currentReason += "Bui min muc do cao. ";
   }
 
   if (danger) {
@@ -647,8 +667,21 @@ void updateTFT() {
       currentStatus = "PHAT HIEN TE NGA!";
     } 
     else if (isHealthAlert) { 
-      tft.setTextColor(ST77XX_ORANGE, ST77XX_BLACK); tft.print("CANH BAO SUC KHOE!  "); 
-      currentStatus = "CANH BAO SUC KHOE!";
+      tft.setTextColor(ST77XX_ORANGE, ST77XX_BLACK); 
+      
+      // Trích xuất lý do đầu tiên (cắt ở dấu chấm) để không bị tràn màn hình
+      String displayReason = healthAlertReason;
+      if (displayReason.indexOf(".") > 0) {
+        displayReason = displayReason.substring(0, displayReason.indexOf("."));
+      }
+      
+      // Bù thêm khoảng trắng để chép đè/xóa sạch dòng chữ cũ
+      while (displayReason.length() < 20) {
+        displayReason += " ";
+      }
+      
+      tft.print(displayReason); 
+      currentStatus = healthAlertReason; // Vẫn lưu chuỗi đầy đủ để gửi lên Firebase
     }
     else { 
       tft.setTextColor(ST77XX_GREEN, ST77XX_BLACK); tft.print("BINH THUONG         "); 
@@ -710,10 +743,33 @@ void setup() {
   String mac = WiFi.macAddress(); mac.replace(":", ""); deviceID = "DEV_" + mac; 
 
   if (WiFi.status() == WL_CONNECTED) {
-    config.api_key = FIREBASE_API_KEY; config.database_url = DATABASE_URL;
-    auth.user.email = "esp32@gmail.com"; auth.user.password = "12345678";
-    signupOK = true; config.token_status_callback = tokenStatusCallback; 
-    Firebase.begin(&config, &auth); Firebase.reconnectWiFi(true);
+    // 1. Đồng bộ giờ chuẩn Internet (NTP) cho chứng chỉ SSL
+    configTime(7 * 3600, 0, "pool.ntp.org", "time.nist.gov");
+    Serial.print("Dang dong bo thoi gian he thong SSL");
+    int ntpTimeout = 0;
+    while (time(nullptr) < 1600000000 && ntpTimeout < 20) { 
+      Serial.print(".");
+      delay(500);
+      ntpTimeout++;
+    }
+    Serial.println(" Xong!");
+
+    // 2. Cấu hình thời gian chờ mạng cho Firebase (Giúp tránh lỗi timeout)
+    config.timeout.socketConnection = 30 * 1000; 
+
+    // 3. Khởi tạo Firebase
+    config.api_key = FIREBASE_API_KEY; 
+    config.database_url = DATABASE_URL;
+    auth.user.email = "esp32@gmail.com"; 
+    auth.user.password = "12345678";
+    signupOK = true; 
+    config.token_status_callback = tokenStatusCallback; 
+    
+    Firebase.begin(&config, &auth); 
+    Firebase.reconnectWiFi(true);
+    
+    // 4. Lùi thời gian lấy thời tiết ra sau để nhường đường cho Firebase kết nối
+    delay(2000); 
     updateWeatherData();
   }
 
@@ -732,7 +788,8 @@ void setup() {
   mlx.begin();
   gpsSerial.begin(GPSBaud, SERIAL_8N1, RXPin, TXPin);
 
-  xTaskCreatePinnedToCore(TaskFirebase, "FirebaseTask", 16384, NULL, 1, &FirebaseTaskHandle, 0);                    
+  // Chuyển Task Firebase sang chạy ở Core 1 để không tranh chấp với hệ thống WiFi
+  xTaskCreatePinnedToCore(TaskFirebase, "FirebaseTask", 16384, NULL, 1, &FirebaseTaskHandle, 1);                    
   lastScreen = -1; 
 }
 
@@ -768,10 +825,10 @@ void loop() {
 
 // ===================== TASK FIREBASE =====================
 void TaskFirebase(void *pvParameters) {
-  for (;;) {
+  while (true) {
     if (Firebase.ready() && signupOK && WiFi.status() == WL_CONNECTED) {
-      int displayBPM = lastBPM;
-      int displaySpO2 = lastSpO2;
+      
+      FirebaseJson json;
       
       String trangThaiDo = "Cho do";
       if (fingerPresent) {
@@ -781,27 +838,37 @@ void TaskFirebase(void *pvParameters) {
       
       String basePath = "Devices/" + deviceID + "/";
 
-      FirebaseJson json;
-      json.set("BPM", displayBPM); 
-      json.set("SpO2", displaySpO2);
-      json.set("TempObj", currentTempObj); json.set("TempAmb", currentTempAmb);
-      json.set("AngleX", currentMpuX); json.set("AngleY", currentMpuY); json.set("AngleZ", currentMpuZ);
+      // Nạp dữ liệu vào JSON
+      json.set("BPM", lastBPM); 
+      json.set("SpO2", lastSpO2);
+      json.set("TempObj", currentTempObj); 
+      json.set("TempAmb", currentTempAmb);
+      json.set("AngleX", currentMpuX); 
+      json.set("AngleY", currentMpuY); 
+      json.set("AngleZ", currentMpuZ);
       json.set("Dust", currentDust); 
-      
       json.set("Alert_SOS", isSOS); 
       json.set("Alert_Fall", isFalling);
       json.set("Alert_Health", isHealthAlert); 
       json.set("Alert_Reason", healthAlertReason); 
-      
       json.set("LastMeasureTime", lastMeasureTimeStr);
       json.set("TrangThai", currentStatus);
       json.set("ThoiGian", currentTimeStr);
       json.set("TrangThaiDo", trangThaiDo);
 
-      if (gps.location.isValid()) { json.set("GPS_Lat", gps.location.lat()); json.set("GPS_Lng", gps.location.lng()); }
+      if (gps.location.isValid()) { 
+        json.set("GPS_Lat", gps.location.lat()); 
+        json.set("GPS_Lng", gps.location.lng()); 
+      }
 
+      // Đẩy dữ liệu lên Firebase
       Firebase.RTDB.setJSON(&fbdo, basePath, &json);
+      
+      // Clear data thừa của object mạng
+      fbdo.clear(); 
     }
-    vTaskDelay(pdMS_TO_TICKS(1500));
+    
+    // Nhường quyền cho Core 1 xử lý các tác vụ khác (màn hình, cảm biến)
+    vTaskDelay(pdMS_TO_TICKS(2000)); 
   }
 }
