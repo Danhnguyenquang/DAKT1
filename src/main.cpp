@@ -1,7 +1,7 @@
 #include <Arduino.h>
 #include <Wire.h>
 #include <WiFi.h>
-#include <time.h> // Thư viện hỗ trợ đồng bộ thời gian thực (NTP)
+#include <time.h>
 
 // ===================== CAM BIEN SUC KHOE & MOI TRUONG =====================
 #include "MAX30105.h"
@@ -16,10 +16,9 @@
 #include <SPI.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_ST7789.h>
-#include "all_frames.h" // FILE ANIMATION
+#include "all_frames.h"
 #include "qrcode.h"
 
-// DINH NGHIA MAU SAC MOI
 #define ST77XX_ORANGE 0xFD20
 #define ST77XX_DARKBLUE 0x01E8
 #define ST77XX_DARKGREEN 0x03E0
@@ -36,9 +35,6 @@
 #include <WiFiManager.h>
 #include <WebServer.h>
 #include <ESPmDNS.h>
-
-// ===================== KHOA API BẢO MẬT =====================
-// Nhúng file secrets.h chứa các mã API (File này đã bị chặn up lên GitHub)
 #include "secrets.h"
 
 String weatherURL = "http://api.openweathermap.org/data/2.5/forecast?lat=" LAT "&lon=" LON "&appid=" WEATHER_API_KEY "&units=metric&cnt=2&lang=vi";
@@ -88,9 +84,7 @@ float currentMpuX = 0.0, currentMpuY = 0.0, currentMpuZ = 0.0;
 float currentDust = 0.0;
 bool isSOS = false, isFalling = false, isHealthAlert = false; 
 
-// THÊM BIẾN LƯU LÝ DO CẢNH BÁO
 String healthAlertReason = ""; 
-
 unsigned long healthDangerTimer = 0; 
 unsigned long lastBeepTime = 0;
 bool buzzerState = false;
@@ -99,7 +93,6 @@ String currentTimeStr = "--:--:-- --/--/----";
 String lastMeasureTimeStr = "Chua do";
 String currentStatus = "BINH THUONG"; 
 
-// BIEN DO NHIP TIM & TIEN TRINH
 uint32_t irBuffer[100];
 uint32_t redBuffer[100];
 int32_t spo2 = 0;
@@ -108,20 +101,16 @@ int32_t heartRateValue = 0;
 int8_t validHeartRate = 0;
 bool max30102Found = false;
 
-// Biến điều khiển độ sáng LED cho MAX30102
 byte currentLEDPower = 0x1F; 
-
 int measurementProgress = 0; 
 bool fingerPresent = false; 
 unsigned long measureCompleteTime = 0; 
 
-// Bộ đếm lọc rác và chốt mẫu
 int validSamplesCollected = 0;
 int ignoredSamples = 0;
 const int SAMPLES_TO_IGNORE = 2; 
 const int TARGET_SAMPLES = 3;    
 
-// CÁC BIẾN LƯU DỮ LIỆU CUỐI CÙNG CHỐT LẠI SAU KHI ĐO 100%
 int lastBPM = 0;
 int lastSpO2 = 0;
 
@@ -137,7 +126,6 @@ unsigned long lastAnimFrame = 0;
 int currentFrame = 0;
 #define FRAME_DELAY 42
 
-// ===================== XỬ LÝ NÚT CHẠM =====================
 volatile unsigned long touchStartTime = 0;
 volatile bool isPressed = false;
 volatile bool shortPressTriggered = false;
@@ -157,7 +145,6 @@ void IRAM_ATTR touchISR() {
   }
 }
 
-// ===================== KHOI TAO NGUYÊN MẪU HÀM =====================
 void updateTFT();
 void drawWeatherScreenStatic();
 void drawWeatherAnimationFrame();
@@ -166,8 +153,8 @@ void drawStaticUI();
 void drawQRScreen(); 
 void TaskFirebase(void *pvParameters);
 
-// ===================== BO LOC TIENG VIET =====================
-String removeAccents(String str) {
+// [Tối ưu] Truyền tham chiếu (const String&) để chống phân mảnh bộ nhớ RAM
+String removeAccents(const String& str) {
   String s = str;
   s.replace("á", "a"); s.replace("à", "a"); s.replace("ả", "a"); s.replace("ã", "a"); s.replace("ạ", "a");
   s.replace("ă", "a"); s.replace("ắ", "a"); s.replace("ằ", "a"); s.replace("ẳ", "a"); s.replace("ẵ", "a"); s.replace("ặ", "a");
@@ -186,7 +173,6 @@ String removeAccents(String str) {
   return s;
 }
 
-// ===================== CÁC HÀM XỬ LÝ DỮ LIỆU =====================
 void sortArray(int *arr, int size) {
   for (int i = 0; i < size - 1; i++) {
     for (int j = i + 1; j < size; j++) {
@@ -214,7 +200,6 @@ void addSpO2Value(int value) {
 int getFilteredBPM() { return getMedian(bpmHistory, bpmCount); }
 int getFilteredSpO2() { return getMedian(spo2History, spo2Count); }
 
-// ===================== XỬ LÝ CẢM BIẾN & THỜI GIAN =====================
 bool initMAX30102() {
   if (!particleSensor.begin(Wire, I2C_SPEED_STANDARD)) return false;
   particleSensor.setup(60, 4, 2, 100, 411, 4096);
@@ -233,7 +218,11 @@ void updateMAX30102Fast() {
   }
   for (byte i = 75; i < 100; i++) {
     long start = millis();
-    while (!particleSensor.available() && millis() - start < 100) { particleSensor.check(); delay(1); }
+    // [Tối ưu] Thêm yield() để chống kẹt WDT
+    while (!particleSensor.available() && millis() - start < 100) { 
+        particleSensor.check(); 
+        yield(); 
+    }
     redBuffer[i] = particleSensor.getRed(); irBuffer[i] = particleSensor.getIR();
     particleSensor.nextSample();
   }
@@ -316,30 +305,23 @@ void updateMAX30102Fast() {
 }
 
 void updateDustSensor() {
-  digitalWrite(DUST_LED_PIN, LOW); // Bật IR LED
-  delayMicroseconds(280);          // Delay 0.28ms
+  digitalWrite(DUST_LED_PIN, LOW);
+  delayMicroseconds(280);          
   
-  int voMeasured = analogRead(DUST_VO_PIN); // Đọc giá trị ADC V0
+  int voMeasured = analogRead(DUST_VO_PIN); 
   
-  delayMicroseconds(40);           // Delay 0.04ms
-  digitalWrite(DUST_LED_PIN, HIGH); // Tắt LED
-  delayMicroseconds(9680);         // Delay 9.68ms (Thời gian nghỉ giống hệt code chuẩn)
+  delayMicroseconds(40);           
+  digitalWrite(DUST_LED_PIN, HIGH); 
+  delayMicroseconds(9680);         
   
-  // Tính điện áp cho ESP32 (Hệ 3.3V, ADC 12-bit 4095)
   float voltage = voMeasured * (3.3 / 4095.0); 
-  
-  // Công thức tuyến tính gốc của Chris Nafis: dustDensity = 0.17 * calcVoltage - 0.1
-  // Đổi đơn vị ra ug/m3 (nhân 1000)
   float rawDustUg = ((0.17 * voltage) - 0.1) * 1000.0;
   
   if (rawDustUg < 0) {
-    rawDustUg = 0; // Không cho phép giá trị âm
+    rawDustUg = 0; 
   }
   
-  // Lọc nhiễu trung bình động
   currentDust = (0.1 * rawDustUg) + (0.9 * currentDust);
-
-  // In thêm Raw ADC để bắt bệnh trên Serial Monitor
   Serial.printf("Raw ADC: %d | Dien ap bui: %.2f V | Bui min: %.0f ug/m3\n", voMeasured, voltage, currentDust);
 }
 
@@ -354,7 +336,6 @@ void updateGPSTime() {
   }
 }
 
-// ===================== API THỜI TIẾT =====================
 void updateWeatherData() {
   if (WiFi.status() != WL_CONNECTED) return;
   HTTPClient http;
@@ -372,7 +353,6 @@ void updateWeatherData() {
   http.end();
 }
 
-// ===================== XỬ LÝ NÚT NHẤN CHÍNH & CẢNH BÁO =====================
 void handleTouchToggle() {
   if (shortPressTriggered) {
     userScreenIndex = (userScreenIndex + 1) % 3; 
@@ -404,7 +384,6 @@ void handleTouchToggle() {
 
   if (sqrt(pow(mpu6050.getAccX(), 2) + pow(mpu6050.getAccY(), 2) + pow(mpu6050.getAccZ(), 2)) > 2.5) isFalling = true;
   
-  // ================= BÓC TÁCH LOGIC CẢNH BÁO =================
   bool danger = false;
   String currentReason = "";
 
@@ -439,7 +418,6 @@ void handleTouchToggle() {
     isHealthAlert = false; 
     healthAlertReason = ""; 
   }
-  // ===========================================================
 
   if (isSOS || isFalling || isHealthAlert) {
     if (millis() - lastBeepTime > 200) { 
@@ -453,7 +431,6 @@ void handleTouchToggle() {
   }
 }
 
-// ===================== GIAO DIỆN HIỂN THỊ TFT =====================
 void showBootScreen() {
   tft.fillScreen(ST77XX_BLACK);
   tft.setTextColor(ST77XX_CYAN); tft.setTextSize(2);
@@ -669,19 +646,17 @@ void updateTFT() {
     else if (isHealthAlert) { 
       tft.setTextColor(ST77XX_ORANGE, ST77XX_BLACK); 
       
-      // Trích xuất lý do đầu tiên (cắt ở dấu chấm) để không bị tràn màn hình
       String displayReason = healthAlertReason;
       if (displayReason.indexOf(".") > 0) {
         displayReason = displayReason.substring(0, displayReason.indexOf("."));
       }
       
-      // Bù thêm khoảng trắng để chép đè/xóa sạch dòng chữ cũ
       while (displayReason.length() < 20) {
         displayReason += " ";
       }
       
       tft.print(displayReason); 
-      currentStatus = healthAlertReason; // Vẫn lưu chuỗi đầy đủ để gửi lên Firebase
+      currentStatus = healthAlertReason; 
     }
     else { 
       tft.setTextColor(ST77XX_GREEN, ST77XX_BLACK); tft.print("BINH THUONG         "); 
@@ -710,11 +685,13 @@ void updateTFT() {
   }
 }
 
-// ===================== WEB SERVER HANDLER =====================
+// [Tối ưu] Đưa nội dung HTML vào bộ nhớ Flash (PROGMEM) thay vì RAM
+const char htmlPage[] PROGMEM = R"rawliteral(<!DOCTYPE html><html lang="vi"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>He Thong Giam Sat Y Te</title><style>body { font-family: sans-serif; text-align: center; background: #f4f4f4; padding: 20px; } button { padding: 10px 20px; background: #007bff; color: #fff; border-radius: 5px; border:none; }</style></head><body><h2>HE THONG GIAM SAT Y TE TRAM KHOANG CACH</h2><input type="text" id="oledText" placeholder="Nhap thong bao cho benh nhan"><button onclick="sendText()">Gui Len Man Hinh</button><script>function sendText() { fetch("/settext?msg=" + document.getElementById("oledText").value).then(() => alert("Da gui thanh cong!")); }</script></body></html>)rawliteral";
+
 void handleRoot() {
-  String html = R"rawliteral(<!DOCTYPE html><html lang="vi"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>He Thong Giam Sat Y Te</title><style>body { font-family: sans-serif; text-align: center; background: #f4f4f4; padding: 20px; } button { padding: 10px 20px; background: #007bff; color: #fff; border-radius: 5px; border:none; }</style></head><body><h2>HE THONG GIAM SAT Y TE TRAM KHOANG CACH</h2><input type="text" id="oledText" placeholder="Nhap thong bao cho benh nhan"><button onclick="sendText()">Gui Len Man Hinh</button><script>function sendText() { fetch("/settext?msg=" + document.getElementById("oledText").value).then(() => alert("Da gui thanh cong!")); }</script></body></html>)rawliteral";
-  server.send(200, "text/html", html);
+  server.send_P(200, "text/html", htmlPage); // Gửi trực tiếp từ Flash
 }
+
 void handleData() {
   String out = weatherValid ? "{\"temp\":" + String((double)weatherData["list"][0]["main"]["temp"], 1) + "}" : "{\"temp\":0}";
   server.send(200, "application/json", out);
@@ -743,7 +720,6 @@ void setup() {
   String mac = WiFi.macAddress(); mac.replace(":", ""); deviceID = "DEV_" + mac; 
 
   if (WiFi.status() == WL_CONNECTED) {
-    // 1. Đồng bộ giờ chuẩn Internet (NTP) cho chứng chỉ SSL
     configTime(7 * 3600, 0, "pool.ntp.org", "time.nist.gov");
     Serial.print("Dang dong bo thoi gian he thong SSL");
     int ntpTimeout = 0;
@@ -754,10 +730,8 @@ void setup() {
     }
     Serial.println(" Xong!");
 
-    // 2. Cấu hình thời gian chờ mạng cho Firebase (Giúp tránh lỗi timeout)
     config.timeout.socketConnection = 30 * 1000; 
 
-    // 3. Khởi tạo Firebase
     config.api_key = FIREBASE_API_KEY; 
     config.database_url = DATABASE_URL;
     auth.user.email = "esp32@gmail.com"; 
@@ -768,7 +742,6 @@ void setup() {
     Firebase.begin(&config, &auth); 
     Firebase.reconnectWiFi(true);
     
-    // 4. Lùi thời gian lấy thời tiết ra sau để nhường đường cho Firebase kết nối
     delay(2000); 
     updateWeatherData();
   }
@@ -788,8 +761,8 @@ void setup() {
   mlx.begin();
   gpsSerial.begin(GPSBaud, SERIAL_8N1, RXPin, TXPin);
 
-  // Chuyển Task Firebase sang chạy ở Core 1 để không tranh chấp với hệ thống WiFi
-  xTaskCreatePinnedToCore(TaskFirebase, "FirebaseTask", 16384, NULL, 1, &FirebaseTaskHandle, 1);                    
+  // [Tối ưu] Đẩy task Firebase sang Core 0 để không tranh chấp tài nguyên với loop() ở Core 1
+  xTaskCreatePinnedToCore(TaskFirebase, "FirebaseTask", 16384, NULL, 1, &FirebaseTaskHandle, 0);                    
   lastScreen = -1; 
 }
 
@@ -838,7 +811,6 @@ void TaskFirebase(void *pvParameters) {
       
       String basePath = "Devices/" + deviceID + "/";
 
-      // Nạp dữ liệu vào JSON
       json.set("BPM", lastBPM); 
       json.set("SpO2", lastSpO2);
       json.set("TempObj", currentTempObj); 
@@ -861,14 +833,11 @@ void TaskFirebase(void *pvParameters) {
         json.set("GPS_Lng", gps.location.lng()); 
       }
 
-      // Đẩy dữ liệu lên Firebase
       Firebase.RTDB.setJSON(&fbdo, basePath, &json);
       
-      // Clear data thừa của object mạng
       fbdo.clear(); 
     }
     
-    // Nhường quyền cho Core 1 xử lý các tác vụ khác (màn hình, cảm biến)
     vTaskDelay(pdMS_TO_TICKS(2000)); 
   }
 }
