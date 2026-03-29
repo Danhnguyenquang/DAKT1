@@ -1,7 +1,17 @@
 #include <Arduino.h>
+#include <FS.h>       
+#include <LittleFS.h> 
 #include <Wire.h>
 #include <WiFi.h>
-#include <time.h>
+#include <time.h> 
+
+// ===================== AI MACHINE LEARNING =====================
+#include <healthycare_inferencing.h> // Gọi "Bộ não" AI vào dự án
+
+// Biến lưu trữ cho mảng dữ liệu AI (Cửa sổ trượt)
+float ai_features[EI_CLASSIFIER_DSP_INPUT_FRAME_SIZE];
+size_t feature_ix = 0;
+unsigned long last_ai_sample = 0;
 
 // ===================== CAM BIEN SUC KHOE & MOI TRUONG =====================
 #include "MAX30105.h"
@@ -16,9 +26,10 @@
 #include <SPI.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_ST7789.h>
-#include "all_frames.h"
+#include "all_frames.h" 
 #include "qrcode.h"
 
+// DINH NGHIA MAU SAC MOI
 #define ST77XX_ORANGE 0xFD20
 #define ST77XX_DARKBLUE 0x01E8
 #define ST77XX_DARKGREEN 0x03E0
@@ -76,8 +87,6 @@ Adafruit_MLX90614 mlx = Adafruit_MLX90614();
 // ===================== BIẾN TOÀN CỤC =====================
 unsigned long lastPrintSensor = 0;
 const unsigned long sensorInterval = 500; 
-unsigned long lastWeatherUpdate = 0;
-const unsigned long weatherInterval = 300000; 
 
 float currentTempObj = 0.0, currentTempAmb = 0.0;
 float currentMpuX = 0.0, currentMpuY = 0.0, currentMpuZ = 0.0;
@@ -93,6 +102,18 @@ String currentTimeStr = "--:--:-- --/--/----";
 String lastMeasureTimeStr = "Chua do";
 String currentStatus = "BINH THUONG"; 
 
+unsigned long lastHistorySave = 0; 
+const unsigned long historyInterval = 15 * 60 * 1000; 
+bool lastSOSState = false;
+bool lastFallState = false;
+bool lastHealthState = false;
+
+// --- BIẾN THEO DÕI BIẾN ĐỘNG DỮ LIỆU ---
+float lastSavedTemp = 0.0;
+int lastSavedBPM = 0;
+int lastSavedSpO2 = 0;
+float lastSavedDust = 0.0;
+
 uint32_t irBuffer[100];
 uint32_t redBuffer[100];
 int32_t spo2 = 0;
@@ -105,6 +126,7 @@ byte currentLEDPower = 0x1F;
 int measurementProgress = 0; 
 bool fingerPresent = false; 
 unsigned long measureCompleteTime = 0; 
+unsigned long lastContinuousUpdateTime = 0; 
 
 int validSamplesCollected = 0;
 int ignoredSamples = 0;
@@ -153,8 +175,7 @@ void drawStaticUI();
 void drawQRScreen(); 
 void TaskFirebase(void *pvParameters);
 
-// [Tối ưu] Truyền tham chiếu (const String&) để chống phân mảnh bộ nhớ RAM
-String removeAccents(const String& str) {
+String removeAccents(const String& str) { 
   String s = str;
   s.replace("á", "a"); s.replace("à", "a"); s.replace("ả", "a"); s.replace("ã", "a"); s.replace("ạ", "a");
   s.replace("ă", "a"); s.replace("ắ", "a"); s.replace("ằ", "a"); s.replace("ẳ", "a"); s.replace("ẵ", "a"); s.replace("ặ", "a");
@@ -218,7 +239,6 @@ void updateMAX30102Fast() {
   }
   for (byte i = 75; i < 100; i++) {
     long start = millis();
-    // [Tối ưu] Thêm yield() để chống kẹt WDT
     while (!particleSensor.available() && millis() - start < 100) { 
         particleSensor.check(); 
         yield(); 
@@ -235,6 +255,7 @@ void updateMAX30102Fast() {
       bpmIndex = 0; spo2Index = 0;
       validSamplesCollected = 0;
       ignoredSamples = 0;
+      lastContinuousUpdateTime = 0; 
       lastScreen = -1; 
 
       if (currentLEDPower != 0x1F) {
@@ -287,12 +308,24 @@ void updateMAX30102Fast() {
           measurementProgress = 10 + (validSamplesCollected * 90 / TARGET_SAMPLES);
 
           if (validSamplesCollected >= TARGET_SAMPLES) {
-            measurementProgress = 100;
+            measurementProgress = 100; 
             measureCompleteTime = millis();
+            lastContinuousUpdateTime = millis(); 
             lastMeasureTimeStr = currentTimeStr; 
             
             lastBPM = getFilteredBPM(); 
             lastSpO2 = getFilteredSpO2(); 
+          }
+        } 
+        else if (measurementProgress == 100) {
+          addBPMValue(currentBPM); 
+          addSpO2Value(spo2);
+          
+          if (millis() - lastContinuousUpdateTime >= 2000) {
+            lastBPM = getFilteredBPM(); 
+            lastSpO2 = getFilteredSpO2(); 
+            lastMeasureTimeStr = currentTimeStr;
+            lastContinuousUpdateTime = millis();
           }
         }
       }
@@ -305,7 +338,7 @@ void updateMAX30102Fast() {
 }
 
 void updateDustSensor() {
-  digitalWrite(DUST_LED_PIN, LOW);
+  digitalWrite(DUST_LED_PIN, LOW); 
   delayMicroseconds(280);          
   
   int voMeasured = analogRead(DUST_VO_PIN); 
@@ -322,7 +355,6 @@ void updateDustSensor() {
   }
   
   currentDust = (0.1 * rawDustUg) + (0.9 * currentDust);
-  Serial.printf("Raw ADC: %d | Dien ap bui: %.2f V | Bui min: %.0f ug/m3\n", voMeasured, voltage, currentDust);
 }
 
 void updateGPSTime() {
@@ -334,23 +366,6 @@ void updateGPSTime() {
     sprintf(timeBuf, "%02d:%02d:%02d %02d/%02d/%04d", h, gps.time.minute(), gps.time.second(), d, m, y);
     currentTimeStr = String(timeBuf);
   }
-}
-
-void updateWeatherData() {
-  if (WiFi.status() != WL_CONNECTED) return;
-  HTTPClient http;
-  http.begin(weatherURL);
-  int httpResponseCode = http.GET();
-  if (httpResponseCode > 0) {
-    String payload = http.getString();
-    weatherData = JSON.parse(payload);
-    if (JSON.typeof(weatherData) != "undefined" && weatherData.hasOwnProperty("list")) {
-      weatherValid = true;
-    } else {
-      weatherValid = false;
-    }
-  }
-  http.end();
 }
 
 void handleTouchToggle() {
@@ -382,7 +397,7 @@ void handleTouchToggle() {
     longPressHandled = false;
   }
 
-  if (sqrt(pow(mpu6050.getAccX(), 2) + pow(mpu6050.getAccY(), 2) + pow(mpu6050.getAccZ(), 2)) > 2.5) isFalling = true;
+  // Đã xóa lệnh sqrt() dựa trên ngưỡng tĩnh lỗi thời ở đây!
   
   bool danger = false;
   String currentReason = "";
@@ -685,16 +700,118 @@ void updateTFT() {
   }
 }
 
-// [Tối ưu] Đưa nội dung HTML vào bộ nhớ Flash (PROGMEM) thay vì RAM
 const char htmlPage[] PROGMEM = R"rawliteral(<!DOCTYPE html><html lang="vi"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>He Thong Giam Sat Y Te</title><style>body { font-family: sans-serif; text-align: center; background: #f4f4f4; padding: 20px; } button { padding: 10px 20px; background: #007bff; color: #fff; border-radius: 5px; border:none; }</style></head><body><h2>HE THONG GIAM SAT Y TE TRAM KHOANG CACH</h2><input type="text" id="oledText" placeholder="Nhap thong bao cho benh nhan"><button onclick="sendText()">Gui Len Man Hinh</button><script>function sendText() { fetch("/settext?msg=" + document.getElementById("oledText").value).then(() => alert("Da gui thanh cong!")); }</script></body></html>)rawliteral";
 
 void handleRoot() {
-  server.send_P(200, "text/html", htmlPage); // Gửi trực tiếp từ Flash
+  server.send_P(200, "text/html", htmlPage); 
 }
 
 void handleData() {
   String out = weatherValid ? "{\"temp\":" + String((double)weatherData["list"][0]["main"]["temp"], 1) + "}" : "{\"temp\":0}";
   server.send(200, "application/json", out);
+}
+
+// ===================== TASK FIREBASE & THỜI TIẾT (Lõi 0) =====================
+unsigned long lastWeatherFetch = 0;
+const unsigned long weatherFetchInterval = 300000; // 5 phút
+
+void TaskFirebase(void *pvParameters) {
+  while (true) {
+    if (WiFi.status() == WL_CONNECTED && (millis() - lastWeatherFetch >= weatherFetchInterval || lastWeatherFetch == 0)) {
+      HTTPClient http;
+      http.begin(weatherURL);
+      int httpResponseCode = http.GET();
+      if (httpResponseCode > 0) {
+        String payload = http.getString();
+        JSONVar tempWeather = JSON.parse(payload);
+        if (JSON.typeof(tempWeather) != "undefined" && tempWeather.hasOwnProperty("list")) {
+          weatherData = tempWeather; 
+          weatherValid = true;
+        }
+      }
+      http.end();
+      lastWeatherFetch = millis();
+      if (currentScreen == 2) drawWeatherScreenStatic();
+    }
+
+    if (Firebase.ready() && signupOK && WiFi.status() == WL_CONNECTED) {
+      FirebaseJson json;
+      
+      String trangThaiDo = "Cho do";
+      if (fingerPresent) {
+        if (measurementProgress < 100) trangThaiDo = "Dang do...";
+        else trangThaiDo = "Do lien tuc"; 
+      }
+      
+      String realtimePath = "Devices/" + deviceID + "/";
+
+      json.set("BPM", lastBPM); 
+      json.set("SpO2", lastSpO2);
+      json.set("TempObj", currentTempObj); 
+      json.set("TempAmb", currentTempAmb);
+      json.set("AngleX", currentMpuX); 
+      json.set("AngleY", currentMpuY); 
+      json.set("AngleZ", currentMpuZ);
+      json.set("Dust", currentDust); 
+      json.set("Alert_SOS", isSOS); 
+      json.set("Alert_Fall", isFalling);
+      json.set("Alert_Health", isHealthAlert); 
+      json.set("Alert_Reason", healthAlertReason); 
+      json.set("LastMeasureTime", lastMeasureTimeStr);
+      json.set("TrangThai", currentStatus);
+      json.set("ThoiGian", currentTimeStr);
+      json.set("TrangThaiDo", trangThaiDo);
+
+      if (gps.location.isValid()) { 
+        json.set("GPS_Lat", gps.location.lat()); 
+        json.set("GPS_Lng", gps.location.lng()); 
+      }
+
+      Firebase.RTDB.setJSON(&fbdo, realtimePath, &json);
+      
+      bool shouldSaveHistory = false;
+      
+      if (millis() - lastHistorySave >= historyInterval || lastHistorySave == 0) shouldSaveHistory = true;
+      if (isSOS && !lastSOSState) shouldSaveHistory = true;
+      if (isFalling && !lastFallState) shouldSaveHistory = true;
+      if (isHealthAlert && !lastHealthState) shouldSaveHistory = true;
+
+      if (lastHistorySave > 0) { 
+        if (abs(currentTempObj - lastSavedTemp) >= 10.0) shouldSaveHistory = true;
+        if (lastBPM > 0 && abs(lastBPM - lastSavedBPM) >= 20) shouldSaveHistory = true;
+        if (lastSpO2 > 0 && abs(lastSpO2 - lastSavedSpO2) >= 5) shouldSaveHistory = true;
+        if (abs(currentDust - lastSavedDust) >= 10.0) shouldSaveHistory = true;
+      }
+
+      lastSOSState = isSOS;
+      lastFallState = isFalling;
+      lastHealthState = isHealthAlert;
+
+      if (shouldSaveHistory) {
+        time_t now = time(nullptr);
+        struct tm timeinfo;
+        localtime_r(&now, &timeinfo);
+        
+        char timeKey[30];
+        sprintf(timeKey, "%04d-%02d-%02d_%02d-%02d-%02d", 
+                timeinfo.tm_year + 1900, timeinfo.tm_mon + 1, timeinfo.tm_mday,
+                timeinfo.tm_hour, timeinfo.tm_min, timeinfo.tm_sec);
+        
+        String historyPath = "Histories/" + deviceID + "/" + String(timeKey);
+        Firebase.RTDB.setJSON(&fbdo, historyPath, &json);
+        
+        lastHistorySave = millis();
+        lastSavedTemp = currentTempObj;
+        lastSavedBPM = lastBPM;
+        lastSavedSpO2 = lastSpO2;
+        lastSavedDust = currentDust;
+      }
+      
+      fbdo.clear(); 
+    }
+    
+    vTaskDelay(pdMS_TO_TICKS(2000)); 
+  }
 }
 
 // ===================== SETUP =====================
@@ -721,17 +838,13 @@ void setup() {
 
   if (WiFi.status() == WL_CONNECTED) {
     configTime(7 * 3600, 0, "pool.ntp.org", "time.nist.gov");
-    Serial.print("Dang dong bo thoi gian he thong SSL");
     int ntpTimeout = 0;
     while (time(nullptr) < 1600000000 && ntpTimeout < 20) { 
-      Serial.print(".");
       delay(500);
       ntpTimeout++;
     }
-    Serial.println(" Xong!");
 
     config.timeout.socketConnection = 30 * 1000; 
-
     config.api_key = FIREBASE_API_KEY; 
     config.database_url = DATABASE_URL;
     auth.user.email = "esp32@gmail.com"; 
@@ -741,9 +854,6 @@ void setup() {
     
     Firebase.begin(&config, &auth); 
     Firebase.reconnectWiFi(true);
-    
-    delay(2000); 
-    updateWeatherData();
   }
 
   if (MDNS.begin("esp32")) Serial.println("mDNS: http://esp32.local");
@@ -761,7 +871,25 @@ void setup() {
   mlx.begin();
   gpsSerial.begin(GPSBaud, SERIAL_8N1, RXPin, TXPin);
 
-  // [Tối ưu] Đẩy task Firebase sang Core 0 để không tranh chấp tài nguyên với loop() ở Core 1
+  tft.fillScreen(ST77XX_BLACK);
+  tft.setTextColor(ST77XX_YELLOW); tft.setTextSize(2);
+  tft.setCursor(30, 110); tft.println("DANG ON DINH");
+  tft.setCursor(45, 140); tft.println("CAM BIEN...");
+  
+  delay(2500); 
+
+  currentTempObj = mlx.readObjectTempC();
+  currentTempAmb = mlx.readAmbientTempC();
+  
+  mpu6050.update();
+  currentMpuX = mpu6050.getAngleX();
+  currentMpuY = mpu6050.getAngleY();
+  currentMpuZ = mpu6050.getAngleZ();
+
+  updateDustSensor(); 
+  delay(10);
+  updateDustSensor();
+
   xTaskCreatePinnedToCore(TaskFirebase, "FirebaseTask", 16384, NULL, 1, &FirebaseTaskHandle, 0);                    
   lastScreen = -1; 
 }
@@ -773,71 +901,62 @@ void loop() {
   while (gpsSerial.available() > 0) gps.encode(gpsSerial.read()); 
   
   updateGPSTime();
-  mpu6050.update();
   updateMAX30102Fast(); 
   updateDustSensor();       
 
   currentTempObj = (0.2 * mlx.readObjectTempC()) + (0.8 * currentTempObj);
   currentTempAmb = (0.2 * mlx.readAmbientTempC()) + (0.8 * currentTempAmb);
-  currentMpuX = (0.3 * mpu6050.getAngleX()) + (0.7 * currentMpuX);
-  currentMpuY = (0.3 * mpu6050.getAngleY()) + (0.7 * currentMpuY);
-  currentMpuZ = (0.3 * mpu6050.getAngleZ()) + (0.7 * currentMpuZ);
 
-  if (millis() - lastWeatherUpdate >= weatherInterval) {
-    lastWeatherUpdate = millis();
-    updateWeatherData();
-    if (currentScreen == 2) drawWeatherScreenStatic(); 
+  // ================= BỘ NÃO AI HOẠT ĐỘNG TẠI ĐÂY =================
+  // Lấy mẫu cảm biến theo đúng tần số (thường là 5ms cho dữ liệu SisFall)
+  if (millis() - last_ai_sample >= EI_CLASSIFIER_INTERVAL_MS) {
+      last_ai_sample = millis();
+
+      // Cập nhật gia tốc thực tế
+      mpu6050.update();
+      currentMpuX = (0.3 * mpu6050.getAngleX()) + (0.7 * currentMpuX);
+      currentMpuY = (0.3 * mpu6050.getAngleY()) + (0.7 * currentMpuY);
+      currentMpuZ = (0.3 * mpu6050.getAngleZ()) + (0.7 * currentMpuZ);
+
+      // Nạp dữ liệu vào mảng (Bảo vệ tràn)
+      if (feature_ix < EI_CLASSIFIER_DSP_INPUT_FRAME_SIZE) {
+          ai_features[feature_ix++] = mpu6050.getAccX();
+          ai_features[feature_ix++] = mpu6050.getAccY();
+          ai_features[feature_ix++] = mpu6050.getAccZ();
+      }
+
+      // Khi mảng "cửa sổ" đã đầy -> Tiến hành suy luận
+      if (feature_ix >= EI_CLASSIFIER_DSP_INPUT_FRAME_SIZE) {
+          signal_t signal;
+          int err = numpy::signal_from_buffer(ai_features, EI_CLASSIFIER_DSP_INPUT_FRAME_SIZE, &signal);
+
+          if (err == 0) {
+              ei_impulse_result_t result = { 0 };
+              err = run_classifier(&signal, &result, false);
+
+              if (err == EI_IMPULSE_OK) {
+                  for (size_t ix = 0; ix < EI_CLASSIFIER_LABEL_COUNT; ix++) {
+                      // Phát hiện nhãn "Fall" và độ tin cậy > 80% (0.8)
+                      if (strcmp(result.classification[ix].label, "Fall") == 0 && result.classification[ix].value > 0.8) {
+                          isFalling = true; // Kích hoạt báo động té ngã!
+                      }
+                  }
+              }
+          }
+
+          // Trượt cửa sổ: Xóa 50% dữ liệu cũ, nhường chỗ cho dữ liệu mới ở chu kỳ sau
+          size_t shift_elements = EI_CLASSIFIER_DSP_INPUT_FRAME_SIZE / 2;
+          memmove(ai_features, ai_features + shift_elements, (EI_CLASSIFIER_DSP_INPUT_FRAME_SIZE - shift_elements) * sizeof(float));
+          feature_ix -= shift_elements; 
+      }
   }
+  // ===============================================================
 
   if (millis() - lastPrintSensor >= sensorInterval) {
     lastPrintSensor = millis();
     updateTFT();
   }
-  delay(10); 
-}
-
-// ===================== TASK FIREBASE =====================
-void TaskFirebase(void *pvParameters) {
-  while (true) {
-    if (Firebase.ready() && signupOK && WiFi.status() == WL_CONNECTED) {
-      
-      FirebaseJson json;
-      
-      String trangThaiDo = "Cho do";
-      if (fingerPresent) {
-        if (measurementProgress < 100) trangThaiDo = "Dang do...";
-        else trangThaiDo = "Hoan tat";
-      }
-      
-      String basePath = "Devices/" + deviceID + "/";
-
-      json.set("BPM", lastBPM); 
-      json.set("SpO2", lastSpO2);
-      json.set("TempObj", currentTempObj); 
-      json.set("TempAmb", currentTempAmb);
-      json.set("AngleX", currentMpuX); 
-      json.set("AngleY", currentMpuY); 
-      json.set("AngleZ", currentMpuZ);
-      json.set("Dust", currentDust); 
-      json.set("Alert_SOS", isSOS); 
-      json.set("Alert_Fall", isFalling);
-      json.set("Alert_Health", isHealthAlert); 
-      json.set("Alert_Reason", healthAlertReason); 
-      json.set("LastMeasureTime", lastMeasureTimeStr);
-      json.set("TrangThai", currentStatus);
-      json.set("ThoiGian", currentTimeStr);
-      json.set("TrangThaiDo", trangThaiDo);
-
-      if (gps.location.isValid()) { 
-        json.set("GPS_Lat", gps.location.lat()); 
-        json.set("GPS_Lng", gps.location.lng()); 
-      }
-
-      Firebase.RTDB.setJSON(&fbdo, basePath, &json);
-      
-      fbdo.clear(); 
-    }
-    
-    vTaskDelay(pdMS_TO_TICKS(2000)); 
-  }
+  
+  // Rút ngắn độ trễ để AI bắt được dữ liệu liên tục và chính xác nhất
+  delay(1); 
 }
