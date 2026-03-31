@@ -62,20 +62,25 @@ bool signupOK = false;
 String deviceID = "";
 TaskHandle_t FirebaseTaskHandle;
 
-// ===================== KHAI BÁO CHÂN PHẦN CỨNG =====================
-#define DUST_VO_PIN  34   
-#define DUST_LED_PIN 14    
-#define TOUCH_PIN    13   
-#define BUZZER_PIN   15   
-#define SDA_PIN      21
-#define SCL_PIN      22
+// ===================== KHAI BÁO CHÂN PHẦN CỨNG MỚI =====================
+#define DUST_VO_PIN  33   // Đã đổi sang G33
+#define DUST_LED_PIN 14   // Giữ nguyên G14
+#define TOUCH_PIN    15   // Đã đổi sang G15
+#define BUZZER_PIN   13   // Đã đổi sang G13
 
-#define TFT_CS   27
-#define TFT_DC   4
-#define TFT_RST  16
-Adafruit_ST7789 tft = Adafruit_ST7789(TFT_CS, TFT_DC, TFT_RST);
+#define SDA_PIN      21   // Giữ nguyên
+#define SCL_PIN      22   // Giữ nguyên
 
-static const int RXPin = 26, TXPin = 25;
+// Cấu hình chân TFT thẳng hàng cho mạch 1 lớp
+#define TFT_SCL  16
+#define TFT_SDA  17
+#define TFT_RST  5
+#define TFT_DC   18
+#define TFT_CS   19
+Adafruit_ST7789 tft = Adafruit_ST7789(&SPI, TFT_CS, TFT_DC, TFT_RST);
+
+// Cấu hình GPS: GPS TX -> ESP RX(35) | GPS RX -> ESP TX(32)
+static const int RXPin = 35, TXPin = 32;
 static const uint32_t GPSBaud = 9600;
 TinyGPSPlus gps;
 HardwareSerial gpsSerial(2); 
@@ -534,7 +539,7 @@ void drawWeatherScreenStatic() {
   tft.drawLine(15, 140, 225, 140, ST77XX_GRAY);
 
   double nextTemp = (double)weatherData["list"][1]["main"]["temp"];
-  String nextDesc = removeAccents((const char*)weatherData["list"][1]["weather"][0]["description"]);
+  String nextDesc = removeAccents((const char*)weatherData["list"][1]["weather"][1]["description"]);
   nextDesc.toUpperCase();
 
   tft.fillRoundRect(15, 155, 210, 25, 4, ST77XX_DARKGREEN);
@@ -825,6 +830,10 @@ void setup() {
   pinMode(DUST_LED_PIN, OUTPUT);
 
   Wire.begin(SDA_PIN, SCL_PIN);
+  
+  // Bẻ lái giao tiếp SPI của màn hình TFT sang các chân mới
+  SPI.begin(TFT_SCL, -1, TFT_SDA, TFT_CS); 
+  
   tft.init(240, 280); tft.setRotation(2); tft.setTextWrap(false);
   showBootScreen();
 
