@@ -164,7 +164,8 @@ void IRAM_ATTR touchISR() {
   } else {
     if (isPressed) {
       unsigned long duration = millis() - touchStartTime;
-      if (duration > 50 && duration < 600) {
+      // FIX DELAY: Giảm mức chặn nhiễu từ 50ms xuống 20ms để bắt được chạm lướt siêu nhanh
+      if (duration > 20 && duration < 600) { 
         shortPressTriggered = true; 
       }
     }
@@ -179,6 +180,7 @@ void drawMeasuringUI();
 void drawStaticUI();
 void drawQRScreen(); 
 void TaskFirebase(void *pvParameters);
+void handleTouchToggle();
 
 String removeAccents(const String& str) { 
   String s = str;
@@ -246,6 +248,7 @@ void updateMAX30102Fast() {
     long start = millis();
     while (!particleSensor.available() && millis() - start < 100) { 
         particleSensor.check(); 
+        handleTouchToggle(); // FIX DELAY: Cho phép quét nút bấm ngay khi đang chờ MAX30102
         yield(); 
     }
     redBuffer[i] = particleSensor.getRed(); irBuffer[i] = particleSensor.getIR();
@@ -401,8 +404,6 @@ void handleTouchToggle() {
   } else {
     longPressHandled = false;
   }
-
-  // Đã xóa lệnh sqrt() dựa trên ngưỡng tĩnh lỗi thời ở đây!
   
   bool danger = false;
   String currentReason = "";
