@@ -110,6 +110,18 @@ float currentMpuX = 0.0, currentMpuY = 0.0, currentMpuZ = 0.0;
 float currentDust = 0.0;
 bool isSOS = false, isFalling = false, isHealthAlert = false;
 
+// ===================== SMART FALL DETECTION (Đếm ngược 10s)
+// =====================
+bool fallWarning = false;
+unsigned long fallWarningStart = 0;
+const unsigned long FALL_COUNTDOWN_MS = 10000;
+
+// ===================== DISPLAY TIMEOUT (Tắt màn hình 30s)
+// =====================
+unsigned long lastActivityTime = 0;
+const unsigned long SCREEN_TIMEOUT_MS = 30000;
+bool screenOff = false;
+
 String healthAlertReason = "";
 unsigned long healthDangerTimer = 0;
 unsigned long lastBeepTime = 0;
@@ -144,6 +156,7 @@ int measurementProgress = 0;
 bool fingerPresent = false;
 unsigned long measureCompleteTime = 0;
 unsigned long lastContinuousUpdateTime = 0;
+unsigned long pulseSearchStart = 0;
 
 int validSamplesCollected = 0;
 int ignoredSamples = 0;
@@ -192,6 +205,9 @@ void drawWeatherAnimationFrame();
 void drawMeasuringUI();
 void drawStaticUI();
 void drawQRScreen();
+void drawFallCountdownScreen();
+void drawSleepScreen();
+void drawStatusBar();
 void TaskFirebase(void *pvParameters);
 void handleTouchToggle();
 
@@ -348,6 +364,7 @@ void updateMAX30102Fast() {
       validSamplesCollected = 0;
       ignoredSamples = 0;
       lastContinuousUpdateTime = 0;
+      pulseSearchStart = 0;
       lastScreen = -1;
 
       if (currentLEDPower != 0x1F) {
@@ -367,6 +384,7 @@ void updateMAX30102Fast() {
     spo2Index = 0;
     validSamplesCollected = 0;
     ignoredSamples = 0;
+    pulseSearchStart = millis();
 
     int32_t currentIR = irBuffer[99];
     if (currentIR < 80000) {
@@ -487,6 +505,25 @@ void updateGPSTime() {
 
 void handleTouchToggle() {
   if (shortPressTriggered) {
+    lastActivityTime = millis();
+
+    if (screenOff) {
+      screenOff = false;
+      lastScreen = -1;
+      updateTFT();
+      shortPressTriggered = false;
+      return;
+    }
+
+    if (fallWarning) {
+      fallWarning = false;
+      fallWarningStart = 0;
+      lastScreen = -1;
+      updateTFT();
+      shortPressTriggered = false;
+      return;
+    }
+
     userScreenIndex = (userScreenIndex + 1) % 4;
     lastScreen = -1;
     updateTFT();
@@ -495,11 +532,20 @@ void handleTouchToggle() {
 
   static bool longPressHandled = false;
   if (isPressed) {
+    lastActivityTime = millis();
     if (!longPressHandled && (millis() - touchStartTime >= 600)) {
+      if (screenOff) {
+        screenOff = false;
+        lastScreen = -1;
+        updateTFT();
+        longPressHandled = true;
+        return;
+      }
       if (isFalling || isSOS || isHealthAlert) {
         isFalling = false;
         isSOS = false;
         isHealthAlert = false;
+        fallWarning = false;
         healthAlertReason = "";
         lastBPM = 0;
         lastSpO2 = 0;
@@ -596,26 +642,117 @@ void showBootScreen() {
   tft.println("DANG KHOI DONG...");
 }
 
-void drawStaticUI() {
-  tft.fillScreen(ST77XX_BLACK);
+// ===================== TFT STATUS BAR (y=0~20) =====================
+void drawStatusBar() {
+  tft.fillRect(0, 0, 240, 20, ST77XX_BLACK);
+  tft.setTextSize(1);
+  if (WiFi.status() == WL_CONNECTED) {
+    tft.setTextColor(ST77XX_GREEN);
+    tft.setCursor(4, 6);
+    tft.print("WiFi OK");
+  } else {
+    tft.setTextColor(ST77XX_RED);
+    tft.setCursor(4, 6);
+    tft.print("NO WiFi");
+  }
+  tft.setTextColor(ST77XX_YELLOW);
+  if (dataMutex != NULL)
+    xSemaphoreTake(dataMutex, portMAX_DELAY);
+  String timeOnly = currentTimeStr;
+  if (dataMutex != NULL)
+    xSemaphoreGive(dataMutex);
+  if (timeOnly.length() >= 8)
+    timeOnly = timeOnly.substring(0, 8);
+  int timeWidth = timeOnly.length() * 6;
+  tft.setCursor(240 - timeWidth - 4, 6);
+  tft.print(timeOnly);
+  tft.drawLine(0, 19, 240, 19, ST77XX_GRAY);
+}
 
-  tft.fillRoundRect(0, 0, 240, 35, 0, ST77XX_DARKGREEN);
+// ===================== MAN HINH DEM NGUOC TE NGA =====================
+void drawFallCountdownScreen() {
+  tft.fillRect(0, 20, 240, 260, ST77XX_BLACK);
+  drawStatusBar();
+  unsigned long elapsed = millis() - fallWarningStart;
+  int remaining = (int)((FALL_COUNTDOWN_MS - elapsed) / 1000);
+  if (remaining < 0)
+    remaining = 0;
+
+  uint16_t borderColor =
+      ((millis() / 300) % 2 == 0) ? ST77XX_RED : ST77XX_ORANGE;
+  tft.drawRoundRect(5, 25, 230, 250, 10, borderColor);
+  tft.drawRoundRect(6, 26, 228, 248, 10, borderColor);
+
+  tft.setTextColor(ST77XX_RED);
+  tft.setTextSize(2);
+  tft.setCursor(35, 40);
+  tft.print("!! CANH BAO !!");
+
+  tft.setTextColor(ST77XX_YELLOW);
+  tft.setTextSize(1);
+  tft.setCursor(30, 70);
+  tft.print("Phat hien te nga! Cham de");
+  tft.setCursor(30, 85);
+  tft.print("HUY trong vong:");
+
+  tft.setTextColor(ST77XX_RED);
+  tft.setTextSize(7);
+  char buf[4];
+  sprintf(buf, "%02d", remaining);
+  tft.setCursor(75, 110);
+  tft.print(buf);
+
   tft.setTextColor(ST77XX_WHITE);
   tft.setTextSize(2);
-  tft.setCursor(35, 10);
+  tft.setCursor(90, 175);
+  tft.print("GIAY");
+
+  int barWidth = (int)(200.0 * elapsed / FALL_COUNTDOWN_MS);
+  if (barWidth > 200)
+    barWidth = 200;
+  tft.drawRect(19, 210, 202, 20, ST77XX_WHITE);
+  tft.fillRect(20, 211, barWidth, 18, ST77XX_RED);
+
+  tft.setTextColor(ST77XX_CYAN);
+  tft.setTextSize(1);
+  tft.setCursor(30, 245);
+  tft.print(">> CHAM de HUY BAO DONG <<");
+}
+
+// ===================== MAN HINH NGU (BLACKOUT) =====================
+void drawSleepScreen() {
+  tft.fillScreen(ST77XX_BLACK);
+  uint16_t dimColor = tft.color565(15, 15, 15);
+  int cx = 120, cy = 140, armW = 12, armH = 40;
+  tft.fillRect(cx - armW / 2, cy - armH, armW, armH * 2, dimColor);
+  tft.fillRect(cx - armH, cy - armW / 2, armH * 2, armW, dimColor);
+  tft.setTextColor(tft.color565(30, 30, 30));
+  tft.setTextSize(1);
+  tft.setCursor(55, 200);
+  tft.print("Cham de danh thuc man hinh");
+}
+
+void drawStaticUI() {
+  tft.fillScreen(ST77XX_BLACK);
+  drawStatusBar();
+
+  tft.fillRoundRect(0, 20, 240, 35, 0, ST77XX_DARKGREEN);
+  tft.setTextColor(ST77XX_WHITE);
+  tft.setTextSize(2);
+  tft.setCursor(35, 28);
   tft.println("TRAM Y TE MINI");
 
   tft.setTextSize(2);
   tft.setTextColor(ST77XX_ORANGE);
-  tft.setCursor(10, 55);
+  tft.setCursor(10, 65);
   tft.print("Nhip tim :");
   tft.setTextColor(ST77XX_CYAN);
-  tft.setCursor(10, 95);
+  tft.setCursor(10, 105);
   tft.print("Oxy mau  :");
 
   tft.setTextSize(1);
   tft.setTextColor(ST77XX_WHITE);
-  tft.setCursor(10, 140);
+  tft.setCursor(10, 145);
   tft.print("Nhiet do co the:");
   tft.setCursor(10, 170);
   tft.print("Nhiet do moi tr:");
@@ -626,9 +763,9 @@ void drawStaticUI() {
 
   tft.setTextSize(1);
   tft.setTextColor(ST77XX_WHITE);
-  tft.setCursor(10, 240);
+  tft.setCursor(10, 237);
   tft.print("Trang thai:");
-  tft.setCursor(10, 260);
+  tft.setCursor(10, 257);
   tft.print("Thoi gian :");
 }
 
@@ -822,6 +959,22 @@ void drawAIDoctorScreen() {
 }
 
 void updateTFT() {
+  // UU TIEN 1: Dem nguoc te nga
+  if (fallWarning) {
+    drawFallCountdownScreen();
+    if (millis() - fallWarningStart >= FALL_COUNTDOWN_MS) {
+      fallWarning = false;
+      fallWarningStart = 0;
+      isFalling = true;
+      lastScreen = -1;
+    }
+    return;
+  }
+
+  // UU TIEN 2: Man hinh ngu
+  if (screenOff)
+    return;
+
   if (measurementProgress > 0) {
     if (measurementProgress < 100) {
       currentScreen = 1;
@@ -858,13 +1011,14 @@ void updateTFT() {
   }
 
   if (currentScreen == 0) {
+    drawStatusBar();
     tft.setTextSize(3);
     tft.setTextColor(ST77XX_YELLOW, ST77XX_BLACK);
 
-    tft.setCursor(140, 50);
+    tft.setCursor(140, 60);
     (lastBPM > 0) ? tft.printf("%-4d", lastBPM) : tft.print("--  ");
 
-    tft.setCursor(140, 90);
+    tft.setCursor(140, 100);
     if (lastSpO2 > 0) {
       tft.printf("%d%%  ", lastSpO2);
     } else {
@@ -873,7 +1027,7 @@ void updateTFT() {
 
     tft.setTextSize(2);
     tft.setTextColor(ST77XX_WHITE, ST77XX_BLACK);
-    tft.setCursor(130, 135);
+    tft.setCursor(130, 140);
     tft.printf("%-5.1fC", currentTempObj);
     tft.setCursor(130, 165);
     tft.printf("%-5.1fC", currentTempAmb);
@@ -884,7 +1038,7 @@ void updateTFT() {
     tft.print(" ug/m3  ");
 
     tft.setTextSize(1);
-    tft.setCursor(85, 240);
+    tft.setCursor(85, 237);
 
     if (isSOS) {
       tft.setTextColor(ST77XX_RED, ST77XX_BLACK);
@@ -931,7 +1085,7 @@ void updateTFT() {
     }
 
     tft.setTextColor(ST77XX_YELLOW, ST77XX_BLACK);
-    tft.setCursor(85, 260);
+    tft.setCursor(85, 257);
     tft.print(currentTimeStr);
   } else if (currentScreen == 1) {
     tft.setTextSize(2);
@@ -1018,14 +1172,18 @@ void TaskFirebase(void *pvParameters) {
         http.addHeader("Content-Type", "application/json");
 
         String prompt =
-            "Nhiệt độ: " + String(currentTempObj) +
-            "C (Sốt:>37.5, Lạnh:<30), " + "Nhịp tim: " + String(lastBPM) +
-            " (Nguy hiểm: <40 hoặc >130), " + "SpO2: " + String(lastSpO2) +
-            "% (Thấp nếu <92%), " + "Bụi mịn: " + String(currentDust) +
-            " (Độc hại nếu >100). " +
-            "Dựa vào quy tắc trên, hãy đưa ra đúng 1 lời khuyên bác sĩ cực "
-            "ngắn (dưới 20 chữ) bằng TIẾNG VIỆT KHÔNG CÓ DẤU cho người dùng "
-            "đang sử dụng thiết bị.";
+            "BAN LA TRO LY Y TE AI 'HEALTHY 365'.\n"
+            "QUY TAC PHAN TICH:\n"
+            "1. NHIP TIM: 60-100 OK. >100 nhanh. <50 hoac >120 la bat thuong.\n"
+            "2. SpO2: 95-100 OK. <94 can theo doi. <90 la NGUY HIEM.\n"
+            "3. NHIET DO DA: 31-35 OK. >37.5 la Sot. <30 la Lanh.\n"
+            "4. PM2.5: <50 an toan. >100 canh bao. >200 nguy hai.\n"
+            "KHAN CAP: Neu SpO2 < 90 hoac phat hien Te Nga/SOS: 'CANH BAO KHAN CAP: NGUY HIEM TINH MÀNG'.\n"
+            "PHONG CACH: Di thang vao phan tich y chinh. Khong chao hoi. Tra ve TIENG VIET KHONG DAU.\n"
+            "DU LIEU: Nhiet do: " + String(currentTempObj) + "C, Nhip tim: " + String(lastBPM) + 
+            " bpm, SpO2: " + String(lastSpO2) + "%, Bui: " + String(currentDust) + 
+            ", SOS: " + (isSOS ? "CO" : "KHONG") + ", Te nga: " + (isFalling ? "CO" : "KHONG") + ".\n"
+            "YEU CAU: Tra ve toi da 15-20 tu. TIENG VIET KHÔNG DẤU. Ket thuc bang cau: *Luu y: Chi xem de tham khao y te.*";
         String requestBody =
             "{\"contents\":[{\"parts\":[{\"text\":\"" + prompt + "\"}]}]}";
 
@@ -1068,17 +1226,36 @@ void TaskFirebase(void *pvParameters) {
       FirebaseJson json;
 
       String trangThaiDo = "Cho do";
+      bool isEmergencyFlatline = false;
       if (fingerPresent) {
-        if (measurementProgress < 100)
+        if (measurementProgress < 100) {
           trangThaiDo = "Dang do...";
-        else
+          // Cơ chế Timeout Ngừng tim (45 giây)
+          if (pulseSearchStart > 0 && (millis() - pulseSearchStart > 45000)) {
+            isEmergencyFlatline = true;
+            isHealthAlert = true;
+            if (dataMutex != NULL)
+              xSemaphoreTake(dataMutex, portMAX_DELAY);
+            healthAlertReason = "NGUY KICH: KHONG TIM THAY MACH!";
+            if (dataMutex != NULL)
+              xSemaphoreGive(dataMutex);
+            lastBPM = 0;
+            lastSpO2 = 0;
+          }
+        } else {
           trangThaiDo = "Do lien tuc";
+        }
       }
 
       String realtimePath = "Devices/" + deviceID + "/";
 
-      json.set("BPM", lastBPM);
-      json.set("SpO2", lastSpO2);
+      // Chỉ cập nhật BPM/SpO2 khi đo xong 100% (và giá trị > 0) hoặc có biến cố
+      // khẩn cấp
+      if ((measurementProgress == 100 && lastBPM > 0) || isEmergencyFlatline) {
+        json.set("BPM", lastBPM);
+        json.set("SpO2", lastSpO2);
+      }
+
       json.set("TempObj", currentTempObj);
       json.set("TempAmb", currentTempAmb);
       json.set("AngleX", currentMpuX);
@@ -1105,7 +1282,23 @@ void TaskFirebase(void *pvParameters) {
         json.set("GPS_Lng", gps.location.lng());
       }
 
-      Firebase.RTDB.setJSON(&fbdo, realtimePath, &json);
+      // Dùng updateNode (PATCH) thay vì setJSON để giữ lại các trường BPM/SpO2
+      // cũ khi không đo
+      Firebase.RTDB.updateNode(&fbdo, realtimePath, &json);
+
+      // ===== TINH NANG #4: Doc lenh huy canh bao tu App =====
+      String cmdPath = "Devices/" + deviceID + "/Cmd_CancelAlert";
+      if (Firebase.RTDB.getBool(&fbdo, cmdPath)) {
+        if (fbdo.boolData() == true) {
+          isSOS = false;
+          isFalling = false;
+          isHealthAlert = false;
+          fallWarning = false;
+          healthAlertReason = "";
+          Firebase.RTDB.setBool(&fbdo, cmdPath, false);
+          lastScreen = -1;
+        }
+      }
 
       bool shouldSaveHistory = false;
 
@@ -1121,7 +1314,8 @@ void TaskFirebase(void *pvParameters) {
       if (lastHistorySave > 0) {
         if (abs(currentTempObj - lastSavedTemp) >= 10.0)
           shouldSaveHistory = true;
-        if (lastBPM > 0 && abs(lastBPM - lastSavedBPM) >= 20)
+        if (lastBPM > 0 && lastSavedBPM > 0 &&
+            abs(lastBPM - lastSavedBPM) >= 20)
           shouldSaveHistory = true;
         if (lastSpO2 > 0 && abs(lastSpO2 - lastSavedSpO2) >= 5)
           shouldSaveHistory = true;
@@ -1142,9 +1336,32 @@ void TaskFirebase(void *pvParameters) {
         sprintf(timeKey, "%04d-%02d-%02d_%02d-%02d-%02d",
                 timeinfo.tm_year + 1900, timeinfo.tm_mon + 1, timeinfo.tm_mday,
                 timeinfo.tm_hour, timeinfo.tm_min, timeinfo.tm_sec);
-
         String historyPath = "Histories/" + deviceID + "/" + String(timeKey);
-        Firebase.RTDB.setJSON(&fbdo, historyPath, &json);
+
+        // Tạo JSON sạch cho lịch sử
+        FirebaseJson historyJson;
+        historyJson.set("TempObj", currentTempObj);
+        historyJson.set("TempAmb", currentTempAmb);
+        historyJson.set("Dust", currentDust);
+        historyJson.set("Alert_SOS", isSOS);
+        historyJson.set("Alert_Fall", isFalling);
+        historyJson.set("Alert_Health", isHealthAlert);
+        if (dataMutex != NULL)
+          xSemaphoreTake(dataMutex, portMAX_DELAY);
+        historyJson.set("Alert_Reason", healthAlertReason);
+        historyJson.set("ThoiGian", currentTimeStr);
+        if (dataMutex != NULL)
+          xSemaphoreGive(dataMutex);
+
+        // CHỈ LƯU BPM/SpO2 KHI CÓ KẾT QUẢ ĐÃ LỌC NHIỄU VÀ HỢP LỆ (>0) HOẶC
+        // NGỪNG TIM
+        if ((measurementProgress == 100 && lastBPM > 0) ||
+            isEmergencyFlatline) {
+          historyJson.set("BPM", lastBPM);
+          historyJson.set("SpO2", lastSpO2);
+        }
+
+        Firebase.RTDB.setJSON(&fbdo, historyPath, &historyJson);
 
         lastHistorySave = millis();
         lastSavedTemp = currentTempObj;
@@ -1191,6 +1408,8 @@ void setup() {
   String mac = WiFi.macAddress();
   mac.replace(":", "");
   deviceID = "DEV_" + mac;
+
+  lastActivityTime = millis();
 
   if (WiFi.status() == WL_CONNECTED) {
     configTime(7 * 3600, 0, "pool.ntp.org", "time.nist.gov");
@@ -1258,9 +1477,10 @@ void setup() {
   updateDustSensor();
 
   xTaskCreatePinnedToCore(TaskFirebase, "FirebaseTask", 32768, NULL, 1,
-                          &FirebaseTaskHandle,
-                          0); // Nang Stack len 32KB de chong tran bo nho (Stack
-                              // Overflow) khi goi SSL HTTPS
+                          &FirebaseTaskHandle, 0);
+
+  lastHistorySave =
+      millis(); // Khởi tạo để tránh lưu lịch sử ngay khi vừa bật máy
   lastScreen = -1;
 }
 
@@ -1309,14 +1529,20 @@ void loop() {
     // những cú rớt từ vị trí cao.
     if (vectorSum > 1.6 && lastFreeFallTime > 0 &&
         (millis() - lastFreeFallTime < 1500)) {
-      isFalling = true;
+      if (!isFalling && !fallWarning) {
+        fallWarning = true;
+        fallWarningStart = millis();
+      }
       lastFreeFallTime = 0;
     }
 
     // 3. Ngoại lệ tàn bạo: Trượt té trên mặt phẳng (không rớt tự do) nhưng lực
     // đập cực kỳ mạnh!
     if (vectorSum > 3.0) {
-      isFalling = true;
+      if (!isFalling && !fallWarning) {
+        fallWarning = true;
+        fallWarningStart = millis();
+      }
     }
 
     // Nạp dữ liệu vào mảng (Bảo vệ tràn)
@@ -1342,7 +1568,10 @@ void loop() {
             // của mô hình
             if (strcmp(result.classification[ix].label, "Fall") == 0 &&
                 result.classification[ix].value > 0.75) {
-              isFalling = true; // Kích hoạt báo động té ngã!
+              if (!isFalling && !fallWarning) {
+                fallWarning = true;
+                fallWarningStart = millis();
+              }
             }
           }
         }
@@ -1364,6 +1593,19 @@ void loop() {
     updateTFT();
   }
 
+  // ===================== DISPLAY TIMEOUT =====================
+  if (!screenOff && !isSOS && !isFalling && !isHealthAlert && !fallWarning) {
+    if (millis() - lastActivityTime >= SCREEN_TIMEOUT_MS) {
+      screenOff = true;
+      drawSleepScreen();
+    }
+  }
+  if (screenOff && (isSOS || isFalling || isHealthAlert || fallWarning)) {
+    screenOff = false;
+    lastScreen = -1;
+    lastActivityTime = millis();
+  }
+
   if (needWeatherRedraw) {
     needWeatherRedraw = false;
     if (currentScreen == 2)
@@ -1376,6 +1618,5 @@ void loop() {
       drawAIDoctorScreen();
   }
 
-  // Rút ngắn độ trễ để AI bắt được dữ liệu liên tục và chính xác nhất
   delay(1);
 }
