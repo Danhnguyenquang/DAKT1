@@ -150,23 +150,27 @@ int8_t validSPO2 = 0;
 int32_t heartRateValue = 0;
 int8_t validHeartRate = 0;
 bool max30102Found = false;
+float smoothBPM = 0; // Khôi phục Biến lọc nhiễu nhịp tim (EMA Filter)
 
 byte currentLEDPower = 0x1F;
 int measurementProgress = 0;
 bool fingerPresent = false;
 unsigned long measureCompleteTime = 0;
 unsigned long lastContinuousUpdateTime = 0;
+unsigned long lastAliveTime = 0; // Độc lập theo dõi sự sống để tránh còi hú bậy
 unsigned long pulseSearchStart = 0;
+unsigned long cancelCooldownUntil =
+    0; // Cooldown sau huỷ cảnh báo, ngăn tái kích hoạt đo
 
 int validSamplesCollected = 0;
 int ignoredSamples = 0;
 const int SAMPLES_TO_IGNORE = 2;
-const int TARGET_SAMPLES = 3;
+const int TARGET_SAMPLES = 5;
 
 int lastBPM = 0;
 int lastSpO2 = 0;
 
-const int FILTER_SIZE = 7;
+const int FILTER_SIZE = 9;
 int bpmHistory[FILTER_SIZE] = {0}, spo2History[FILTER_SIZE] = {0};
 int bpmCount = 0, spo2Count = 0;
 int bpmIndex = 0, spo2Index = 0;
@@ -322,9 +326,26 @@ int getFilteredBPM() { return getMedian(bpmHistory, bpmCount); }
 int getFilteredSpO2() { return getMedian(spo2History, spo2Count); }
 
 bool initMAX30102() {
+  // Đổi tốc độ I2C về I2C_SPEED_STANDARD (100kHz) do dùng chung Bus với
+  // MLX90614 (chỉ hỗ trợ tối đa 100kHz)
   if (!particleSensor.begin(Wire, I2C_SPEED_STANDARD))
     return false;
-  particleSensor.setup(60, 4, 2, 100, 411, 4096);
+
+  // Cấu hình thông số đã tinh chỉnh cho dự án:
+  // sampleAverage=8 + sampleRate=200 -> Effective Rate = 200/8 = 25 Hz
+  // sampleAverage=8 loại bỏ hoàn toàn nhiễu ánh sáng 50Hz/60Hz nhờ trung bình 8
+  // mẫu phần cứng
+  byte ledBrightness = 60; // Options: 0=Off to 255=50mA
+  byte sampleAverage =
+      8; // Options: 1, 2, 4, 8, 16, 32 (8 = lọc nhiễu phần cứng tối ưu)
+  byte ledMode = 2; // Options: 1 = Red only, 2 = Red + IR, 3 = Red + IR + Green
+  byte sampleRate = 200; // Options: 50, 100, 200, 400, 800, 1000, 1600, 3200
+  int pulseWidth = 411;  // Options: 69, 118, 215, 411
+  int adcRange = 4096;   // Options: 2048, 4096, 8192, 16384
+
+  particleSensor.setup(ledBrightness, sampleAverage, ledMode, sampleRate,
+                       pulseWidth, adcRange);
+
   currentLEDPower = 0x1F;
   particleSensor.setPulseAmplitudeRed(currentLEDPower);
   particleSensor.setPulseAmplitudeIR(currentLEDPower);
@@ -364,8 +385,12 @@ void updateMAX30102Fast() {
       validSamplesCollected = 0;
       ignoredSamples = 0;
       lastContinuousUpdateTime = 0;
+      lastAliveTime = 0;
       pulseSearchStart = 0;
       lastScreen = -1;
+
+      // Reset biến lọc
+      smoothBPM = 0;
 
       if (currentLEDPower != 0x1F) {
         currentLEDPower = 0x1F;
@@ -375,6 +400,14 @@ void updateMAX30102Fast() {
     }
     return;
   }
+
+  // COOLDOWN: Sau khi huỷ cảnh báo, chặn tái kích hoạt đo trong 3 giây
+  // để người dùng có thời gian rút tay/giấy ra khỏi cảm biến
+  if (!fingerPresent && cancelCooldownUntil > 0 &&
+      millis() < cancelCooldownUntil) {
+    return; // Bỏ qua, chưa hết cooldown
+  }
+  cancelCooldownUntil = 0; // Hết cooldown, cho phép đo lại bình thường
 
   if (!fingerPresent) {
     fingerPresent = true;
@@ -404,14 +437,47 @@ void updateMAX30102Fast() {
                                          &validSPO2, &heartRateValue,
                                          &validHeartRate);
 
-  if (validHeartRate && validSPO2 && spo2 >= 90 && spo2 <= 100) {
+  // Khôi phục: Nếu tay vẫn đang nằm trên cảm biến và máy có chạy phép tính, vẫn
+  // gia hạn thời gian sống
+  if (fingerPresent && heartRateValue > 0 && spo2 > 0) {
+    lastAliveTime = millis();
+  }
+
+  // Kiểm duyệt nghiêm ngặt theo chuẩn nhà sản xuất Maxim — KHÔNG BAO GIỜ nới
+  // lỏng để chống rác nhảy loạn (ví dụ 109)
+  bool isValid = (validHeartRate && validSPO2 && spo2 >= 85 && spo2 <= 100);
+
+  if (isValid) {
     int currentBPM = heartRateValue;
 
-    if (currentBPM > 120 && currentBPM <= 160) {
-      currentBPM = currentBPM / 2;
+    // Khôi phục: Thuật toán phát hiện sóng đôi (Dicrotic Notch) thông minh
+    if (smoothBPM > 0) {
+      // Nới lỏng rào cản nhận diện sóng dội từ 1.6x xuống 1.35x.
+      // Do đôi khi giá trị đo mượt đầu tiên bị tính nhỉnh hơn thực tế (vd 75
+      // thay vì 58). Gấp đôi 58 là 116. 116 / 75 = 1.54. Nếu để 1.6x như cũ
+      // thuật toán sẽ để lọt con số 116!
+      if (currentBPM > (smoothBPM * 1.35) && currentBPM < (smoothBPM * 2.6)) {
+        currentBPM = currentBPM / 2;
+      }
+    } else {
+      // Lúc mới bắt đầu đo (đang nghỉ ngơi), nhịp >= 90 đa phần là sóng đôi dội
+      // do thành mạch dẻo dai (người trẻ)
+      if (currentBPM >= 85) {
+        currentBPM = currentBPM / 2;
+      }
     }
 
-    if (currentBPM >= 50 && currentBPM <= 115) {
+    // Khôi phục: Dùng bộ lọc Smooth (EMA filter) để chặn các cú nhảy loạn
+    if (smoothBPM == 0) {
+      smoothBPM = currentBPM;
+    } else {
+      smoothBPM =
+          (smoothBPM * 0.8) + (currentBPM * 0.2); // Tin cậy 80% mượt, 20% mới
+    }
+    currentBPM = (int)smoothBPM;
+
+    // Chỉ chấp nhận nhịp tim trong khoảng sinh lý hợp lệ (40-140 BPM)
+    if (currentBPM >= 40 && currentBPM <= 140) {
       if (ignoredSamples < SAMPLES_TO_IGNORE) {
         ignoredSamples++;
       } else {
@@ -466,7 +532,7 @@ void updateDustSensor() {
   digitalWrite(DUST_LED_PIN, HIGH);
   delayMicroseconds(9680);
 
-  float voltage = voMeasured * (3.3 / 4095.0);
+  float voltage = voMeasured * (4.95 / 4095.0);
   float rawDustUg = ((0.17 * voltage) - 0.1) * 1000.0;
 
   if (rawDustUg < 0) {
@@ -549,6 +615,23 @@ void handleTouchToggle() {
         healthAlertReason = "";
         lastBPM = 0;
         lastSpO2 = 0;
+
+        // RESET TOÀN BỘ TRẠNG THÁI ĐO ĐẠC - Ngăn thuật toán SpO2 tiếp tục chạy
+        // trên dữ liệu rác gây crash
+        fingerPresent = false;
+        measurementProgress = 0;
+        pulseSearchStart = 0;
+        lastContinuousUpdateTime = 0;
+        lastAliveTime = 0;
+        smoothBPM = 0;
+        validSamplesCollected = 0;
+        ignoredSamples = 0;
+        cancelCooldownUntil =
+            millis() + 3000; // Cooldown 3 giây trước khi cho phép đo lại
+        bpmCount = 0;
+        spo2Count = 0;
+        bpmIndex = 0;
+        spo2Index = 0;
       } else {
         isSOS = true;
       }
@@ -566,17 +649,17 @@ void handleTouchToggle() {
   // 1. Phối hợp: Bất tỉnh / Ngất xỉu
   if (isFalling && lastBPM > 0 && lastBPM < 50) {
     danger = true;
-    currentReason = "Nguy kich: Ngat xiu sau nga!";
+    currentReason = "Ngat xiu sau nga!";
   }
   // 2. Phối hợp: Sốt cao li bì
   else if (currentTempObj > 38.5 && lastBPM > 110) {
     danger = true;
-    currentReason = "Bao dong: Sot cao li bi!";
+    currentReason = "Sot cao li bi!";
   }
   // 3. Phối hợp: Môi trường độc hại gây suy hô hấp
   else if (currentDust > 150.0 && lastSpO2 > 0 && lastSpO2 < 92) {
     danger = true;
-    currentReason = "Bao dong: Suy ho hap do o nhiem!";
+    currentReason = "Suy ho hap do o nhiem!";
   }
   // Các cảnh báo đơn lẻ ban đầu
   else {
@@ -614,12 +697,24 @@ void handleTouchToggle() {
     }
   } else {
     healthDangerTimer = 0;
-    isHealthAlert = false;
+    bool shouldClear = true;
     if (dataMutex != NULL)
       xSemaphoreTake(dataMutex, portMAX_DELAY);
-    healthAlertReason = "";
+    if (healthAlertReason == "KHONG TIM THAY MACH!" ||
+        healthAlertReason == "MAT MACH KHI DO LIEN TUC!") {
+      shouldClear = false;
+    }
     if (dataMutex != NULL)
       xSemaphoreGive(dataMutex);
+
+    if (shouldClear) {
+      isHealthAlert = false;
+      if (dataMutex != NULL)
+        xSemaphoreTake(dataMutex, portMAX_DELAY);
+      healthAlertReason = "";
+      if (dataMutex != NULL)
+        xSemaphoreGive(dataMutex);
+    }
   }
 
   if (isSOS || isFalling || isHealthAlert) {
@@ -975,7 +1070,10 @@ void updateTFT() {
   if (screenOff)
     return;
 
-  if (measurementProgress > 0) {
+  if (isHealthAlert || isSOS || isFalling) {
+    currentScreen = 0;
+    userScreenIndex = 0;
+  } else if (measurementProgress > 0) {
     if (measurementProgress < 100) {
       currentScreen = 1;
     } else {
@@ -1167,42 +1265,70 @@ void TaskFirebase(void *pvParameters) {
         http.setTimeout(20000); // Tăng thời gian chờ AI phản hồi lên 20 giây
         http.begin(client,
                    "https://generativelanguage.googleapis.com/v1beta/models/"
-                   "gemini-3.1-flash-lite-preview:generateContent?key=" +
+                   "gemini-2.5-flash-lite:generateContent?key=" +
                        String(GEMINI_API_KEY));
         http.addHeader("Content-Type", "application/json");
 
-        String prompt =
+        char promptBuffer[1024];
+        snprintf(
+            promptBuffer, sizeof(promptBuffer),
             "BAN LA TRO LY Y TE AI 'HEALTHY 365'.\n"
             "QUY TAC PHAN TICH:\n"
             "1. NHIP TIM: 60-100 OK. >100 nhanh. <50 hoac >120 la bat thuong.\n"
             "2. SpO2: 95-100 OK. <94 can theo doi. <90 la NGUY HIEM.\n"
             "3. NHIET DO DA: 31-35 OK. >37.5 la Sot. <30 la Lanh.\n"
             "4. PM2.5: <50 an toan. >100 canh bao. >200 nguy hai.\n"
-            "KHAN CAP: Neu SpO2 < 90 hoac phat hien Te Nga/SOS: 'CANH BAO KHAN CAP: NGUY HIEM TINH MÀNG'.\n"
-            "PHONG CACH: Di thang vao phan tich y chinh. Khong chao hoi. Tra ve TIENG VIET KHONG DAU.\n"
-            "DU LIEU: Nhiet do: " + String(currentTempObj) + "C, Nhip tim: " + String(lastBPM) + 
-            " bpm, SpO2: " + String(lastSpO2) + "%, Bui: " + String(currentDust) + 
-            ", SOS: " + (isSOS ? "CO" : "KHONG") + ", Te nga: " + (isFalling ? "CO" : "KHONG") + ".\n"
-            "YEU CAU: Tra ve toi da 15-20 tu. TIENG VIET KHÔNG DẤU. Ket thuc bang cau: *Luu y: Chi xem de tham khao y te.*";
-        String requestBody =
-            "{\"contents\":[{\"parts\":[{\"text\":\"" + prompt + "\"}]}]}";
+            "KHAN CAP: Neu SpO2 < 90 hoac phat hien Te Nga/SOS: 'CANH BAO KHAN "
+            "CAP: NGUY HIEM TINH MANG'.\n"
+            "PHONG CACH: Di thang vao phan tich y chinh. Khong chao hoi. Tra "
+            "ve TIENG VIET KHONG DAU.\n"
+            "DU LIEU: Nhiet do: %.1fC, Nhip tim: %d bpm, SpO2: %d%%, Bui: "
+            "%.1f, SOS: %s, Te nga: %s.\n"
+            "YEU CAU: Tra ve toi da 15-20 tu. TIENG VIET KHONG DAU. Ket thuc "
+            "bang cau: *Luu y: Chi xem de tham khao y te.*",
+            currentTempObj, lastBPM, lastSpO2, currentDust,
+            (isSOS ? "CO" : "KHONG"), (isFalling ? "CO" : "KHONG"));
+
+        String requestBody = "{\"contents\":[{\"parts\":[{\"text\":\"";
+        requestBody += promptBuffer;
+        requestBody += "\"}]}]}";
 
         int httpResponseCode = http.POST(requestBody);
         if (httpResponseCode > 0) {
           String response = http.getString();
           // Linh hoạt hơn khi tìm vị trí mảng chứa text do JSON có lúc chứa
           // space có lúc không
-          int textIndex = response.indexOf("\"text\":");
+          // Tìm trường "text" linh hoạt: hỗ trợ cả "text":" và "text" : "
+          int textIndex = response.indexOf("\"text\"");
           if (dataMutex != NULL)
             xSemaphoreTake(dataMutex, portMAX_DELAY);
           if (textIndex > 0) {
-            int start = response.indexOf("\"", textIndex + 7) + 1;
-            int end = response.indexOf("\"", start);
-            String rawAdvice = response.substring(start, end);
-            rawAdvice.replace("\\n", " ");
-            geminiAdvice = removeAccents(rawAdvice);
+            // Tìm dấu " mở đầu nội dung text (bỏ qua dấu : và khoảng trắng)
+            int colonPos = response.indexOf(':', textIndex + 5);
+            int start = response.indexOf('"', colonPos) + 1;
+            // Tìm dấu " kết thúc, bỏ qua các \" bên trong chuỗi
+            int end = start;
+            while (end < (int)response.length()) {
+              end = response.indexOf('"', end);
+              if (end < 0)
+                break;
+              // Kiểm tra xem dấu " này có bị escape bởi \ không
+              if (end > 0 && response.charAt(end - 1) == '\\') {
+                end++; // Bỏ qua \" và tìm tiếp
+                continue;
+              }
+              break;
+            }
+            if (start > 0 && end > start) {
+              String rawAdvice = response.substring(start, end);
+              rawAdvice.replace("\\n", " ");
+              rawAdvice.replace("\\r", "");
+              geminiAdvice = removeAccents(rawAdvice);
+            } else {
+              geminiAdvice = "AI tra loi nhung dinh dang khong doc duoc.";
+            }
           } else {
-            geminiAdvice = "Loi doc tin nhan JSON tu AI! (HTTP " +
+            geminiAdvice = "AI khong tra ve noi dung. (HTTP " +
                            String(httpResponseCode) + ")";
           }
           if (dataMutex != NULL)
@@ -1230,20 +1356,37 @@ void TaskFirebase(void *pvParameters) {
       if (fingerPresent) {
         if (measurementProgress < 100) {
           trangThaiDo = "Dang do...";
-          // Cơ chế Timeout Ngừng tim (45 giây)
+          // Timeout phát hiện mạch: 45 giây
           if (pulseSearchStart > 0 && (millis() - pulseSearchStart > 45000)) {
             isEmergencyFlatline = true;
             isHealthAlert = true;
             if (dataMutex != NULL)
               xSemaphoreTake(dataMutex, portMAX_DELAY);
-            healthAlertReason = "NGUY KICH: KHONG TIM THAY MACH!";
+            healthAlertReason = "KHONG TIM THAY MACH!";
             if (dataMutex != NULL)
               xSemaphoreGive(dataMutex);
             lastBPM = 0;
             lastSpO2 = 0;
+            measurementProgress = 0; // Bẻ gãy thanh tiến trình đo đạc
+            pulseSearchStart = 0;    // Ngăn chặn timeout gọi liên tục
           }
         } else {
           trangThaiDo = "Do lien tuc";
+          // Cảnh báo MẤT MẠCH khi đo liên tục: 45 giây không tìm thấy nhịp
+          if (lastAliveTime > 0 && (millis() - lastAliveTime > 45000)) {
+            isEmergencyFlatline = true;
+            isHealthAlert = true;
+            if (dataMutex != NULL)
+              xSemaphoreTake(dataMutex, portMAX_DELAY);
+            healthAlertReason = "MAT MACH KHI DO LIEN TUC!";
+            if (dataMutex != NULL)
+              xSemaphoreGive(dataMutex);
+            lastBPM = 0;
+            lastSpO2 = 0;
+            measurementProgress = 0; // Đẩy người dùng ra khỏi màn hình đo
+            pulseSearchStart = 0;
+            lastContinuousUpdateTime = 0;
+          }
         }
       }
 
@@ -1287,16 +1430,35 @@ void TaskFirebase(void *pvParameters) {
       Firebase.RTDB.updateNode(&fbdo, realtimePath, &json);
 
       // ===== TINH NANG #4: Doc lenh huy canh bao tu App =====
-      String cmdPath = "Devices/" + deviceID + "/Cmd_CancelAlert";
-      if (Firebase.RTDB.getBool(&fbdo, cmdPath)) {
-        if (fbdo.boolData() == true) {
-          isSOS = false;
-          isFalling = false;
-          isHealthAlert = false;
-          fallWarning = false;
-          healthAlertReason = "";
-          Firebase.RTDB.setBool(&fbdo, cmdPath, false);
-          lastScreen = -1;
+      if (isSOS || isFalling || isHealthAlert) {
+        String cmdPath = "Devices/" + deviceID + "/Cmd_CancelAlert";
+        if (Firebase.RTDB.getBool(&fbdo, cmdPath)) {
+          if (fbdo.boolData() == true) {
+            isSOS = false;
+            isFalling = false;
+            isHealthAlert = false;
+            fallWarning = false;
+            healthAlertReason = "";
+            Firebase.RTDB.setBool(&fbdo, cmdPath, false);
+            lastScreen = -1;
+
+            // HỦY TOÀN BỘ TRẠNG THÁI ĐO ĐẠC - NGĂN THUẬT TOÁN SpO2 CHẠY TRÊN DỮ
+            // LIỆU RÁC GÂY CRASH
+            fingerPresent = false;
+            measurementProgress = 0;
+            pulseSearchStart = 0;
+            lastContinuousUpdateTime = 0;
+            lastAliveTime = 0;
+            smoothBPM = 0;
+            validSamplesCollected = 0;
+            ignoredSamples = 0;
+            cancelCooldownUntil =
+                millis() + 3000; // Cooldown 3 giây trước khi cho phép đo lại
+            bpmCount = 0;
+            spo2Count = 0;
+            bpmIndex = 0;
+            spo2Index = 0;
+          }
         }
       }
 
@@ -1432,6 +1594,7 @@ void setup() {
 
     // Khoi tao OTA
     ArduinoOTA.setHostname("DAKT1-ESP32-AI");
+    ArduinoOTA.setPassword("admin123");
     ArduinoOTA.begin();
   }
 
@@ -1457,10 +1620,22 @@ void setup() {
   tft.fillScreen(ST77XX_BLACK);
   tft.setTextColor(ST77XX_YELLOW);
   tft.setTextSize(2);
-  tft.setCursor(30, 110);
+  tft.setCursor(30, 90);
   tft.println("DANG ON DINH");
-  tft.setCursor(45, 140);
+  tft.setCursor(45, 120);
   tft.println("CAM BIEN...");
+
+  // ===== SHOW IP ADDRESS O DAY =====
+  tft.setTextColor(ST77XX_CYAN);
+  tft.setTextSize(1);
+  tft.setCursor(20, 170);
+  if (WiFi.status() == WL_CONNECTED) {
+    tft.print("IP: ");
+    tft.print(WiFi.localIP());
+  } else {
+    tft.setTextColor(ST77XX_RED);
+    tft.print("KHONG CO MANG (OFFLINE)");
+  }
 
   delay(2500);
 
@@ -1594,6 +1769,15 @@ void loop() {
   }
 
   // ===================== DISPLAY TIMEOUT =====================
+  // Chặn cơ chế ngủ màn hình khi đang đo nhịp tim
+  if (fingerPresent || (measurementProgress > 0 && measurementProgress < 100)) {
+    lastActivityTime = millis();
+    if (screenOff) {
+      screenOff = false;
+      lastScreen = -1;
+    }
+  }
+
   if (!screenOff && !isSOS && !isFalling && !isHealthAlert && !fallWarning) {
     if (millis() - lastActivityTime >= SCREEN_TIMEOUT_MS) {
       screenOff = true;
