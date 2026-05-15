@@ -1,0 +1,13 @@
+{
+  "name": "healthycare_inferencing",
+  "version": "1.0.0",
+  "build": {
+    "srcDir": ".",
+    "srcFilter": [
+      "+<*>"
+    ],
+    "flags": [
+      "-I."
+    ]
+  }
+}
